@@ -15,6 +15,7 @@
  */
 
 import { GoogleGenAI } from '@google/genai';
+import { aiCircuitBreaker } from '../ai/aiCircuitBreaker';
 import {
   CanonicalWatchlistItem,
   AlertRule,
@@ -40,7 +41,7 @@ export class WatchlistAlertService {
   private events: AlertEvent[] = [];
   private lastEvaluatedAt: string | null = null;
   private aiClient: GoogleGenAI | null = null;
-  private readonly modelName = 'gemini-2.5-flash';
+  private readonly modelName = aiCircuitBreaker.getModelName();
 
   constructor() {
     this.seedDefaultData();
@@ -742,6 +743,12 @@ export class WatchlistAlertService {
       return event.contextualAnalysis;
     }
 
+    if (!aiCircuitBreaker.canExecuteAi()) {
+      const fallback = `Observed ${event.alertType} on ${event.symbol || 'Portfolio'}. Verified via ${event.provider} (${event.epistemicStatus}). Deterministic surveillance active.`;
+      event.contextualAnalysis = fallback;
+      return fallback;
+    }
+
     const client = this.getClient();
     if (!client) {
       const fallback = `Deterministic trigger from ${event.provider}. Provider verification: ${event.epistemicStatus}. AI contextual analysis engine currently unconfigured.`;
@@ -772,11 +779,13 @@ ALERT DETAILS:
         contents: prompt
       });
 
+      aiCircuitBreaker.recordSuccess();
+
       const analysis = response.text?.trim() || `Deterministic trigger from ${event.provider} (${event.epistemicStatus}).`;
       event.contextualAnalysis = analysis;
       return analysis;
     } catch (err) {
-      console.warn('[WatchlistAlertService] Gemini contextual analysis error:', err);
+      aiCircuitBreaker.handleAiError('WatchlistAlertService', err);
       const fallback = `Observed ${event.alertType} on ${event.symbol || 'Portfolio'}. Verified via ${event.provider} (${event.epistemicStatus}). Contextual AI generation temporarily unavailable.`;
       event.contextualAnalysis = fallback;
       return fallback;

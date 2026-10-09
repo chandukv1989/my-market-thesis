@@ -4,6 +4,7 @@ import { ProvenanceBadge } from './common/ProvenanceBadge';
 import { ThesisStatusBadge } from './common/ThesisStatusBadge';
 import { FinancialQuarterlyChart } from './common/FinancialChart';
 import { InvestmentAssessmentView } from './decision/InvestmentAssessmentView';
+import { InvestmentEventsView } from './decision/InvestmentEventsView';
 import {
   Shield,
   Clock,
@@ -43,11 +44,12 @@ export const StockDeepDiveView: React.FC<StockDeepDiveViewProps> = ({
   allStocks,
   onSelectTicker
 }) => {
-  const [activeTab, setActiveTab] = useState<'thesis' | 'decision' | 'financials' | 'committee' | 'fit' | 'evidence'>('decision');
+  const [activeTab, setActiveTab] = useState<'thesis' | 'decision' | 'events' | 'financials' | 'committee' | 'fit' | 'evidence'>('decision');
   const [expandedPillar, setExpandedPillar] = useState<number | null>(0);
 
   const tabs = [
     { id: 'decision' as const, label: 'Investment Assessment' },
+    { id: 'events' as const, label: 'Events & Thesis Impact' },
     { id: 'thesis' as const, label: 'Investment Thesis' },
     { id: 'financials' as const, label: 'Financials & Quarters' },
     { id: 'committee' as const, label: 'AI Investment Committee' },
@@ -313,6 +315,16 @@ export const StockDeepDiveView: React.FC<StockDeepDiveViewProps> = ({
           portfolio={portfolio}
           allStocks={allStocks}
           onSelectTicker={onSelectTicker}
+        />
+      )}
+
+      {/* TAB CONTENT: INVESTMENT EVENT INTELLIGENCE & THESIS IMPACT (PHASE 24) */}
+      {activeTab === 'events' && (
+        <InvestmentEventsView
+          securityId={stock.canonicalId || stock.id || (stock.market === 'INDIA' ? `in-${stock.ticker.toLowerCase()}` : `us-${stock.ticker.toLowerCase()}`)}
+          ticker={stock.ticker}
+          market={stock.market}
+          onOpenEvidence={onOpenEvidence}
         />
       )}
 

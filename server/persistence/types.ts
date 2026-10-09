@@ -26,7 +26,39 @@ import {
   PersistenceProviderType,
   User,
   AuthenticatedSession,
-  InvestmentEvent
+  InvestmentEvent,
+  InvestmentMonitor,
+  InvestmentMonitorReview,
+  AnalystReviewNote,
+  MonitoringPolicy,
+  AlertInstance,
+  AlertLifecycleStatus,
+  AlertSeverity,
+  AlertRuleType,
+  ResearchPrioritySnapshot,
+  ResearchPriorityItem,
+  CrossInvestmentSnapshot,
+  PortfolioScenarioSnapshot,
+  CounterfactualSnapshot,
+  ResearchMemoryEntry,
+  ResearchQuestionEntry,
+  ResearchMemoryType,
+  ResearchMemoryStatus,
+  ResearchQuestionStatus,
+  ResearchGapRecord,
+  InvestigationPlan,
+  InvestigationAuditRecord,
+  ResearchGapStatus,
+  InvestigationPlanStatus,
+  ResearchGapType,
+  EvidenceCollectionRecord,
+  EvidenceResearchRelationship,
+  EvidenceAuditRecord,
+  CollectionStatus,
+  EvidenceSourceClass,
+  EvidenceRelationshipType,
+  EvidenceAuditAction,
+  EpistemicStatus
 } from '../../src/types';
 
 export interface ISecurityRepository {
@@ -52,6 +84,7 @@ export interface IPersistentEvidenceRepository {
   getEvidence(evidenceId: string): Promise<EvidenceItem | null>;
   get?(evidenceId: string): Promise<EvidenceItem | null>;
   queryEvidence(filter: EvidenceFilter): Promise<EvidenceItem[]>;
+  getBySecurityId?(securityId: string, asOfDate?: string): Promise<EvidenceItem[]>;
   getHistoricalEvidence(evidenceId: string, asOfDate?: string): Promise<EvidenceItem | null>;
   getEvidenceLineage(evidenceId: string): Promise<EvidenceItem[]>;
   count(): Promise<number>;
@@ -157,6 +190,202 @@ export interface IInvestmentEventRepository {
   count(): Promise<number>;
 }
 
+export interface IInvestmentMonitorRepository {
+  get(monitorId: string): Promise<InvestmentMonitor | null>;
+  getBySecurityId(securityId: string, userId?: string): Promise<InvestmentMonitor | null>;
+  getByUserId(userId: string): Promise<InvestmentMonitor[]>;
+  getAll(): Promise<InvestmentMonitor[]>;
+  save(monitor: InvestmentMonitor): Promise<InvestmentMonitor>;
+  update(monitorId: string, updates: Partial<InvestmentMonitor>): Promise<boolean>;
+  delete(monitorId: string): Promise<boolean>;
+  count(): Promise<number>;
+  addNote(monitorId: string, note: AnalystReviewNote): Promise<AnalystReviewNote>;
+  getNotes(monitorId: string): Promise<AnalystReviewNote[]>;
+}
+
+export interface IInvestmentMonitorReviewRepository {
+  get(reviewId: string): Promise<InvestmentMonitorReview | null>;
+  getByMonitorId(monitorId: string): Promise<InvestmentMonitorReview[]>;
+  getAll(): Promise<InvestmentMonitorReview[]>;
+  save(review: InvestmentMonitorReview): Promise<InvestmentMonitorReview>; // IMMUTABLE
+  count(): Promise<number>;
+}
+
+export interface IMonitoringPolicyRepository {
+  get(policyId: string): Promise<MonitoringPolicy | null>;
+  getByUserId(userId: string): Promise<MonitoringPolicy[]>;
+  getAll(): Promise<MonitoringPolicy[]>;
+  save(policy: MonitoringPolicy): Promise<MonitoringPolicy>;
+  update(policyId: string, updates: Partial<MonitoringPolicy>): Promise<boolean>;
+  delete(policyId: string): Promise<boolean>;
+  count(): Promise<number>;
+}
+
+export interface IAlertOrchestrationRepository {
+  get(alertId: string): Promise<AlertInstance | null>;
+  getByUserId(userId: string, filter?: {
+    status?: AlertLifecycleStatus;
+    severity?: AlertSeverity;
+    monitorId?: string;
+    securityId?: string;
+    limit?: number;
+  }): Promise<AlertInstance[]>;
+  getRecentByFingerprint(fingerprint: string): Promise<AlertInstance | null>;
+  getRecentByRule(userId: string, targetId: string, ruleType: AlertRuleType): Promise<AlertInstance | null>;
+  getAll(): Promise<AlertInstance[]>;
+  save(alert: AlertInstance): Promise<AlertInstance>;
+  update(alertId: string, updates: Partial<AlertInstance>): Promise<boolean>;
+  delete(alertId: string): Promise<boolean>;
+  count(): Promise<number>;
+}
+
+export interface IResearchPriorityRepository {
+  getSnapshot(snapshotId: string): Promise<ResearchPrioritySnapshot | null>;
+  getLatestSnapshot(userId: string, universeType?: string): Promise<ResearchPrioritySnapshot | null>;
+  getSnapshotsByUserId(userId: string): Promise<ResearchPrioritySnapshot[]>;
+  saveSnapshot(snapshot: ResearchPrioritySnapshot): Promise<ResearchPrioritySnapshot>;
+  getAll(): Promise<ResearchPrioritySnapshot[]>;
+  count(): Promise<number>;
+}
+
+export interface ICrossInvestmentSnapshotRepository {
+  getSnapshot(snapshotId: string): Promise<CrossInvestmentSnapshot | null>;
+  getSnapshotsByUserId(userId: string): Promise<CrossInvestmentSnapshot[]>;
+  saveSnapshot(snapshot: CrossInvestmentSnapshot): Promise<CrossInvestmentSnapshot>;
+  getAll(): Promise<CrossInvestmentSnapshot[]>;
+  count(): Promise<number>;
+}
+
+export interface IPortfolioScenarioRepository {
+  getSnapshot(snapshotId: string): Promise<PortfolioScenarioSnapshot | null>;
+  getSnapshotsByUserId(userId: string): Promise<PortfolioScenarioSnapshot[]>;
+  saveSnapshot(snapshot: PortfolioScenarioSnapshot): Promise<PortfolioScenarioSnapshot>;
+  getAll(): Promise<PortfolioScenarioSnapshot[]>;
+  count(): Promise<number>;
+}
+
+export interface ICounterfactualRepository {
+  getSnapshot(snapshotId: string): Promise<CounterfactualSnapshot | null>;
+  getSnapshotsByUserId(userId: string): Promise<CounterfactualSnapshot[]>;
+  saveSnapshot(snapshot: CounterfactualSnapshot): Promise<CounterfactualSnapshot>;
+  getAll(): Promise<CounterfactualSnapshot[]>;
+  count(): Promise<number>;
+}
+
+export interface IResearchMemoryRepository {
+  get(id: string): Promise<ResearchMemoryEntry | null>;
+  getAll(filter?: {
+    securityId?: string;
+    userId?: string;
+    asOfDate?: string;
+    memoryType?: ResearchMemoryType;
+    status?: ResearchMemoryStatus;
+  }): Promise<ResearchMemoryEntry[]>;
+  save(entry: ResearchMemoryEntry): Promise<ResearchMemoryEntry>; // IMMUTABLE: duplicate ID overwrite prohibited
+  update(entry: ResearchMemoryEntry): Promise<ResearchMemoryEntry>;
+  count(): Promise<number>;
+}
+
+export interface IResearchQuestionRepository {
+  get(id: string): Promise<ResearchQuestionEntry | null>;
+  getAll(filter?: {
+    securityId?: string;
+    userId?: string;
+    status?: ResearchQuestionStatus;
+    asOfDate?: string;
+  }): Promise<ResearchQuestionEntry[]>;
+  save(question: ResearchQuestionEntry): Promise<ResearchQuestionEntry>;
+  update(question: ResearchQuestionEntry): Promise<ResearchQuestionEntry>;
+  count(): Promise<number>;
+}
+
+export interface IResearchGapRepository {
+  get(id: string): Promise<ResearchGapRecord | null>;
+  getAll(filter?: {
+    securityId?: string;
+    userId?: string;
+    status?: ResearchGapStatus;
+    asOfDate?: string;
+    gapType?: ResearchGapType;
+  }): Promise<ResearchGapRecord[]>;
+  save(gap: ResearchGapRecord): Promise<ResearchGapRecord>;
+  update(gap: ResearchGapRecord): Promise<ResearchGapRecord>;
+  count(): Promise<number>;
+}
+
+export interface IInvestigationPlanRepository {
+  get(id: string): Promise<InvestigationPlan | null>;
+  getAll(filter?: {
+    securityId?: string;
+    userId?: string;
+    status?: InvestigationPlanStatus;
+    asOfDate?: string;
+  }): Promise<InvestigationPlan[]>;
+  save(plan: InvestigationPlan): Promise<InvestigationPlan>;
+  update(plan: InvestigationPlan): Promise<InvestigationPlan>;
+  count(): Promise<number>;
+}
+
+export interface IInvestigationAuditRepository {
+  get(id: string): Promise<InvestigationAuditRecord | null>;
+  getAll(filter?: {
+    targetId?: string;
+    tenantId?: string;
+    targetType?: string;
+    asOfDate?: string;
+  }): Promise<InvestigationAuditRecord[]>;
+  save(audit: InvestigationAuditRecord): Promise<InvestigationAuditRecord>;
+  count(): Promise<number>;
+}
+
+export interface IEvidenceCollectionRepository {
+  get(collectionId: string): Promise<EvidenceCollectionRecord | null>;
+  getBySourceFingerprint(fingerprint: string, tenantId?: string): Promise<EvidenceCollectionRecord | null>;
+  getAll(filter?: {
+    securityId?: string;
+    userId?: string;
+    tenantId?: string;
+    planId?: string;
+    taskId?: string;
+    questionId?: string;
+    gapId?: string;
+    status?: CollectionStatus;
+    sourceType?: EvidenceSourceClass;
+    epistemicStatus?: EpistemicStatus;
+    asOfDate?: string;
+  }): Promise<EvidenceCollectionRecord[]>;
+  save(record: EvidenceCollectionRecord): Promise<EvidenceCollectionRecord>;
+  update(record: EvidenceCollectionRecord): Promise<EvidenceCollectionRecord>;
+  count(): Promise<number>;
+}
+
+export interface IEvidenceRelationshipRepository {
+  get(relationshipId: string): Promise<EvidenceResearchRelationship | null>;
+  getAll(filter?: {
+    sourceId?: string;
+    targetId?: string;
+    targetType?: string;
+    relationshipType?: EvidenceRelationshipType;
+    tenantId?: string;
+    asOfDate?: string;
+  }): Promise<EvidenceResearchRelationship[]>;
+  save(rel: EvidenceResearchRelationship): Promise<EvidenceResearchRelationship>;
+  delete(relationshipId: string): Promise<boolean>;
+  count(): Promise<number>;
+}
+
+export interface IEvidenceAuditRepository {
+  get(auditId: string): Promise<EvidenceAuditRecord | null>;
+  getAll(filter?: {
+    collectionId?: string;
+    tenantId?: string;
+    action?: EvidenceAuditAction;
+    asOfDate?: string;
+  }): Promise<EvidenceAuditRecord[]>;
+  save(audit: EvidenceAuditRecord): Promise<EvidenceAuditRecord>;
+  count(): Promise<number>;
+}
+
 export interface IPersistenceAdapter {
   readonly status: PersistenceStatusCode;
   readonly provider: PersistenceProviderType;
@@ -183,6 +412,22 @@ export interface IPersistenceAdapter {
   getUserRepository(): IUserRepository;
   getSessionRepository(): ISessionRepository;
   getEventRepository(): IInvestmentEventRepository;
+  getMonitorRepository(): IInvestmentMonitorRepository;
+  getMonitorReviewRepository(): IInvestmentMonitorReviewRepository;
+  getPolicyRepository(): IMonitoringPolicyRepository;
+  getAlertOrchestrationRepository(): IAlertOrchestrationRepository;
+  getResearchPriorityRepository(): IResearchPriorityRepository;
+  getCrossInvestmentSnapshotRepository(): ICrossInvestmentSnapshotRepository;
+  getPortfolioScenarioRepository(): IPortfolioScenarioRepository;
+  getCounterfactualRepository(): ICounterfactualRepository;
+  getResearchMemoryRepository(): IResearchMemoryRepository;
+  getResearchQuestionRepository(): IResearchQuestionRepository;
+  getResearchGapRepository(): IResearchGapRepository;
+  getInvestigationPlanRepository(): IInvestigationPlanRepository;
+  getInvestigationAuditRepository(): IInvestigationAuditRepository;
+  getEvidenceCollectionRepository(): IEvidenceCollectionRepository;
+  getEvidenceRelationshipRepository(): IEvidenceRelationshipRepository;
+  getEvidenceAuditRepository(): IEvidenceAuditRepository;
 
   getStatus(): Promise<PersistenceStatusResponse>;
 }

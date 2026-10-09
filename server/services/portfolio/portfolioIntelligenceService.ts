@@ -12,6 +12,7 @@
  */
 
 import { GoogleGenAI } from '@google/genai';
+import { aiCircuitBreaker } from '../ai/aiCircuitBreaker';
 import {
   PortfolioMetrics,
   PortfolioAnalysisRequest,
@@ -34,7 +35,7 @@ import { resolveSecurity } from '../../../src/data/canonicalSecurities';
 
 export class PortfolioIntelligenceService {
   private aiClient: GoogleGenAI | null = null;
-  private readonly modelName = 'gemini-2.5-flash';
+  private readonly modelName = aiCircuitBreaker.getModelName();
 
   private getClient(): GoogleGenAI | null {
     if (!this.aiClient) {
@@ -332,7 +333,7 @@ export class PortfolioIntelligenceService {
     }
 
     // If Gemini is available, ground explanation through LLM
-    if (client) {
+    if (client && aiCircuitBreaker.canExecuteAi()) {
       try {
         const systemPrompt = `You are the Portfolio Intelligence Explainer for an investment system.
 You MUST adhere strictly to these principles:
@@ -389,6 +390,7 @@ Return a valid JSON object with the following fields:
         const text = response.text?.trim();
         if (text) {
           const parsed = JSON.parse(text);
+          aiCircuitBreaker.recordSuccess();
           return {
             headline: parsed.headline || `Portfolio Analysis: ${intent}`,
             facts: Array.isArray(parsed.facts) && parsed.facts.length > 0 ? parsed.facts : baseFactsList,
@@ -400,7 +402,7 @@ Return a valid JSON object with the following fields:
           };
         }
       } catch (err) {
-        console.warn('[PortfolioIntelligenceService] Gemini explanation fallback:', err);
+        aiCircuitBreaker.handleAiError('PortfolioIntelligenceService', err);
       }
     }
 

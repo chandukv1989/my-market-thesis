@@ -6,6 +6,7 @@
  */
 
 import { GoogleGenAI } from '@google/genai';
+import { aiCircuitBreaker } from '../ai/aiCircuitBreaker';
 import {
   ResearchRequest,
   ResearchResponse,
@@ -70,16 +71,26 @@ export class GeminiResearchEngine implements ResearchEngine {
       return cached.response;
     }
 
-    // 2. Validate environment credentials
+    // 2. Validate environment credentials and quota
     if (!this.isConfigured()) {
       if (fallbackOnError) {
-        console.warn('[GeminiResearchEngine] GEMINI_API_KEY unconfigured; utilizing deterministic evidence fallback.');
         const fallback = this.generateDeterministicFallback(request, 'Gemini API unconfigured. Synthesizing directly from verified evidence repository.');
         this.cache.set(cacheKey, { response: fallback, timestamp: now });
         return fallback;
       }
       throw new Error(
         'Gemini Research Engine requires a configured GEMINI_API_KEY on the server. Please verify your environment settings.'
+      );
+    }
+
+    if (!aiCircuitBreaker.canExecuteAi()) {
+      if (fallbackOnError) {
+        const fallback = this.generateDeterministicFallback(request, 'Gemini API prepayment credits or quota currently limited. Synthesizing directly from verified evidence repository.');
+        this.cache.set(cacheKey, { response: fallback, timestamp: now });
+        return fallback;
+      }
+      throw new Error(
+        'Gemini Research Engine: Gemini API prepayment credits or quota are depleted. Please verify project billing and credits in Google AI Studio settings.'
       );
     }
 
@@ -107,6 +118,8 @@ export class GeminiResearchEngine implements ResearchEngine {
       // Parse and normalize JSON
       const parsed = this.parseAndValidateResponse(responseText, request);
 
+      aiCircuitBreaker.recordSuccess();
+
       // Store in cache
       this.cache.set(cacheKey, {
         response: parsed,
@@ -115,15 +128,16 @@ export class GeminiResearchEngine implements ResearchEngine {
 
       return parsed;
     } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      console.error('[GeminiResearchEngine] Generation error:', errMsg);
-      let userFriendlyMsg = errMsg;
-      if (errMsg.includes('prepayment credits') || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('429')) {
-        userFriendlyMsg = 'Gemini API prepayment credits or quota are depleted (HTTP 429). Please verify project billing and credits in Google AI Studio settings.';
+      const { isQuotaIssue, reason } = aiCircuitBreaker.handleAiError('GeminiResearchEngine', err);
+      const rawMsg = err instanceof Error ? err.message : String(err);
+
+      let userFriendlyMsg = rawMsg;
+      if (isQuotaIssue) {
+        userFriendlyMsg = 'Gemini API prepayment credits or quota are depleted. Deterministic evidence synthesis active.';
       }
 
-      if (fallbackOnError) {
-        console.warn(`[GeminiResearchEngine] Activating deterministic evidence fallback due to: ${userFriendlyMsg}`);
+      // Always return high-fidelity deterministic evidence fallback if quota issue or fallback requested
+      if (isQuotaIssue || fallbackOnError) {
         const fallback = this.generateDeterministicFallback(request, userFriendlyMsg);
         this.cache.set(cacheKey, { response: fallback, timestamp: now });
         return fallback;

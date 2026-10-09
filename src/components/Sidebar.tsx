@@ -11,7 +11,16 @@ import {
   Cpu,
   BookOpen,
   ChevronLeft,
-  ChevronRight
+  ChevronRight,
+  Radar,
+  Activity,
+  Network,
+  ShieldAlert,
+  GitFork,
+  History,
+  ListTodo,
+  Database,
+  ShieldCheck
 } from 'lucide-react';
 import { ActiveScreen } from '../types';
 
@@ -33,6 +42,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleCollapse
 }) => {
   const navItems = [
+    { id: 'pilot-readiness' as ActiveScreen, label: 'Pilot Readiness', icon: ShieldCheck, highlight: true },
+    { id: 'command-center' as ActiveScreen, label: 'Command Center', icon: Activity, highlight: true },
+    { id: 'cross-investment' as ActiveScreen, label: 'Cross-Investment', icon: Network, highlight: true },
+    { id: 'scenario-intelligence' as ActiveScreen, label: 'Scenario & Stress', icon: ShieldAlert, highlight: true },
+    { id: 'counterfactual-intelligence' as ActiveScreen, label: 'Counterfactual Intel', icon: GitFork, highlight: true },
+    { id: 'research-memory' as ActiveScreen, label: 'Research Memory', icon: History, highlight: true },
+    { id: 'investigation-planning' as ActiveScreen, label: 'Investigation Plan', icon: ListTodo, highlight: true },
+    { id: 'evidence-ledger' as ActiveScreen, label: 'Evidence Ledger', icon: Database, highlight: true },
     { id: 'dashboard' as ActiveScreen, label: 'Dashboard', icon: LayoutDashboard },
     { id: 'discover' as ActiveScreen, label: 'Discover', icon: Compass },
     {
@@ -45,6 +62,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     { id: 'strategies' as ActiveScreen, label: 'Strategies', icon: Layers },
     { id: 'backtesting' as ActiveScreen, label: 'Backtesting', icon: LineChart },
     { id: 'research' as ActiveScreen, label: 'Research & RAG', icon: BookOpen },
+    { id: 'monitor' as ActiveScreen, label: 'Monitor & Health', icon: Radar },
     { id: 'watchlist' as ActiveScreen, label: 'Watchlist', icon: Eye },
     {
       id: 'alerts' as ActiveScreen,

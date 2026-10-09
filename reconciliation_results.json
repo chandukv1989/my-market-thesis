@@ -1,0 +1,208 @@
+{
+  "results": [
+    {
+      "suite": "Phase 20",
+      "file": "tests/phase20.test.ts",
+      "discovered": 32,
+      "passed": 32,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 8637
+    },
+    {
+      "suite": "Phase 21 Acceptance",
+      "file": "tests/phase21.test.ts",
+      "discovered": 42,
+      "passed": 42,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 10438
+    },
+    {
+      "suite": "Phase 23",
+      "file": "tests/phase23.test.ts",
+      "discovered": 11,
+      "passed": 11,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 1716
+    },
+    {
+      "suite": "Phase 24",
+      "file": "tests/phase24.test.ts",
+      "discovered": 10,
+      "passed": 10,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 2595
+    },
+    {
+      "suite": "Phase 25",
+      "file": "tests/phase25.test.ts",
+      "discovered": 12,
+      "passed": 12,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 5980
+    },
+    {
+      "suite": "Phase 25 Acceptance",
+      "file": "tests/phase25_acceptance.test.ts",
+      "discovered": 8,
+      "passed": 8,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 12074
+    },
+    {
+      "suite": "Phase 26",
+      "file": "tests/phase26.test.ts",
+      "discovered": 12,
+      "passed": 12,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 8155
+    },
+    {
+      "suite": "Phase 26.1 Acceptance",
+      "file": "tests/phase26_acceptance.test.ts",
+      "discovered": 18,
+      "passed": 18,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 21293
+    },
+    {
+      "suite": "Phase 27.1 Acceptance",
+      "file": "tests/phase27_acceptance.test.ts",
+      "discovered": 18,
+      "passed": 18,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 27685
+    },
+    {
+      "suite": "Phase 28 Acceptance",
+      "file": "tests/phase28_acceptance.test.ts",
+      "discovered": 12,
+      "passed": 12,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 7579
+    },
+    {
+      "suite": "Phase 28.1 Validation",
+      "file": "tests/phase28_1_validation.test.ts",
+      "discovered": 12,
+      "passed": 12,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 21748
+    },
+    {
+      "suite": "Phase 29 Acceptance",
+      "file": "tests/phase29_acceptance.test.ts",
+      "discovered": 24,
+      "passed": 24,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 24190
+    },
+    {
+      "suite": "Phase 30 Acceptance",
+      "file": "tests/phase30_acceptance.test.ts",
+      "discovered": 61,
+      "passed": 61,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 5511
+    },
+    {
+      "suite": "Phase 31 Acceptance",
+      "file": "tests/phase31_acceptance.test.ts",
+      "discovered": 74,
+      "passed": 74,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 5430
+    },
+    {
+      "suite": "Phase 32 Acceptance",
+      "file": "tests/phase32_acceptance.test.ts",
+      "discovered": 72,
+      "passed": 72,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 6345
+    },
+    {
+      "suite": "Phase 33 Acceptance",
+      "file": "tests/phase33_acceptance.test.ts",
+      "discovered": 52,
+      "passed": 52,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 15149
+    },
+    {
+      "suite": "Phase 34 Acceptance",
+      "file": "tests/phase34_acceptance.test.ts",
+      "discovered": 65,
+      "passed": 65,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 49233
+    },
+    {
+      "suite": "Phase 35 Acceptance",
+      "file": "tests/phase35_acceptance.test.ts",
+      "discovered": 71,
+      "passed": 71,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 63517
+    },
+    {
+      "suite": "Phase 36 Acceptance",
+      "file": "tests/phase36_acceptance.test.ts",
+      "discovered": 108,
+      "passed": 108,
+      "failed": 0,
+      "skipped": 0,
+      "status": "PASSED",
+      "durationMs": 37289
+    },
+    {
+      "suite": "Phase 37 Certification",
+      "file": "tests/phase37_certification.test.ts",
+      "discovered": 1,
+      "passed": 0,
+      "failed": 1,
+      "skipped": 0,
+      "status": "FAILED",
+      "durationMs": 38980
+    }
+  ],
+  "totalDiscovered": 715,
+  "totalPassed": 714,
+  "totalFailed": 1,
+  "totalSkipped": 0
+}

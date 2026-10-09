@@ -253,7 +253,172 @@ export const MIGRATIONS: Migration[] = [
         generated_answer TEXT,
         framework_version TEXT NOT NULL DEFAULT '1.0.0',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );`
+      );`,
+
+      // 14. Investment Events (Phase 24)
+      `CREATE TABLE IF NOT EXISTS investment_events (
+        event_id TEXT PRIMARY KEY,
+        security_id TEXT NOT NULL,
+        ticker TEXT,
+        market TEXT NOT NULL,
+        exchange TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        event_date TEXT NOT NULL,
+        announced_at TEXT NOT NULL,
+        available_at TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_reference TEXT NOT NULL,
+        evidence_ids JSONB DEFAULT '[]'::jsonb,
+        epistemic_status TEXT NOT NULL,
+        is_simulated BOOLEAN NOT NULL DEFAULT FALSE,
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        structured_data JSONB,
+        previous_state JSONB,
+        current_state JSONB,
+        affected_dimensions JSONB,
+        affected_thesis_areas JSONB,
+        affected_decision_id TEXT,
+        affected_snapshot_id TEXT,
+        significance JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_investment_events_sec_date ON investment_events(security_id, available_at DESC);`
+    ]
+  },
+  {
+    version: 2,
+    name: '002_monitors_policies_and_alerts',
+    up: [
+      // 15. Investment Monitors (Phase 25)
+      `CREATE TABLE IF NOT EXISTS investment_monitors (
+        monitor_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        security_id TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        company_name TEXT NOT NULL,
+        market TEXT NOT NULL,
+        status TEXT NOT NULL,
+        review_cadence TEXT NOT NULL,
+        last_reviewed_at TIMESTAMPTZ,
+        baseline_decision_id TEXT,
+        baseline_snapshot_id TEXT,
+        baseline_event_timestamp TEXT,
+        baseline_composite_score DOUBLE PRECISION,
+        baseline_rating TEXT,
+        baseline_thesis_status TEXT,
+        latest_decision_id TEXT,
+        latest_snapshot_id TEXT,
+        latest_event_timestamp TEXT,
+        latest_composite_score DOUBLE PRECISION,
+        latest_rating TEXT,
+        thesis_status TEXT,
+        invalidation_status TEXT NOT NULL,
+        portfolio_exposure JSONB NOT NULL DEFAULT '{"hasExposure":false}'::jsonb,
+        last_change_summary TEXT,
+        epistemic_status TEXT NOT NULL DEFAULT 'REAL',
+        is_analytical_only BOOLEAN NOT NULL DEFAULT TRUE,
+        execution_prohibited BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_investment_monitors_user ON investment_monitors(user_id);
+      CREATE INDEX IF NOT EXISTS idx_investment_monitors_sec ON investment_monitors(security_id);`,
+
+      // 16. Monitor Reviews (Phase 26)
+      `CREATE TABLE IF NOT EXISTS monitor_reviews (
+        review_id TEXT PRIMARY KEY,
+        monitor_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        security_id TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        reviewed_at TIMESTAMPTZ NOT NULL,
+        as_of_date TEXT NOT NULL,
+        previous_review_id TEXT,
+        previous_decision_id TEXT,
+        current_decision_id TEXT,
+        previous_snapshot_id TEXT,
+        current_snapshot_id TEXT,
+        change_summary JSONB,
+        changes JSONB DEFAULT '[]'::jsonb,
+        thesis_health JSONB,
+        decision_delta JSONB,
+        thesis_delta JSONB,
+        event_delta JSONB,
+        evidence_delta JSONB,
+        portfolio_delta JSONB,
+        quant_delta JSONB,
+        valuation_delta JSONB,
+        invalidation_delta JSONB,
+        data_quality_delta JSONB,
+        explanation JSONB,
+        analyst_notes JSONB DEFAULT '[]'::jsonb,
+        epistemic_status TEXT NOT NULL DEFAULT 'REAL',
+        is_analytical_only BOOLEAN NOT NULL DEFAULT TRUE,
+        execution_prohibited BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_monitor_reviews_monitor ON monitor_reviews(monitor_id, reviewed_at DESC);`,
+
+      // 17. Monitoring Policies (Phase 27)
+      `CREATE TABLE IF NOT EXISTS monitoring_policies (
+        policy_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        policy_type TEXT NOT NULL,
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        scope TEXT NOT NULL,
+        monitor_id TEXT,
+        security_id TEXT,
+        portfolio_id TEXT,
+        rules JSONB NOT NULL DEFAULT '[]'::jsonb,
+        configuration JSONB NOT NULL DEFAULT '{}'::jsonb,
+        min_severity TEXT NOT NULL,
+        cooldown_minutes INTEGER NOT NULL DEFAULT 60,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_monitoring_policies_user ON monitoring_policies(user_id);`,
+
+      // 18. Orchestrated Alerts (Phase 27)
+      `CREATE TABLE IF NOT EXISTS orchestrated_alerts (
+        alert_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL,
+        policy_id TEXT,
+        policy_name TEXT,
+        monitor_id TEXT,
+        security_id TEXT,
+        symbol TEXT,
+        company_name TEXT,
+        portfolio_id TEXT,
+        user_id TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        rule_type TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        status TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        deterministic_explanation TEXT NOT NULL,
+        contextual_analysis TEXT,
+        detected_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        delivered_at TIMESTAMPTZ,
+        acknowledged_at TIMESTAMPTZ,
+        resolved_at TIMESTAMPTZ,
+        dismissed_at TIMESTAMPTZ,
+        fingerprint TEXT NOT NULL,
+        trigger_data JSONB NOT NULL,
+        provenance_data JSONB NOT NULL,
+        review_reference JSONB DEFAULT '{}'::jsonb,
+        audit_trail JSONB DEFAULT '[]'::jsonb,
+        is_analytical_only BOOLEAN NOT NULL DEFAULT TRUE,
+        execution_prohibited BOOLEAN NOT NULL DEFAULT TRUE
+      );
+      CREATE INDEX IF NOT EXISTS idx_orchestrated_alerts_user ON orchestrated_alerts(user_id, status);
+      CREATE INDEX IF NOT EXISTS idx_orchestrated_alerts_fingerprint ON orchestrated_alerts(fingerprint);`
     ]
   }
 ];

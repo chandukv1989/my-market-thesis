@@ -68,6 +68,10 @@ export class SecEdgarProvider implements SECDataProvider {
     };
   }
 
+  public getProviderHealth(): ProviderHealth {
+    return this.getHealthStatus();
+  }
+
   private async fetchSecJson<T>(url: string, cacheKey: string): Promise<T> {
     const cached = this.cache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {

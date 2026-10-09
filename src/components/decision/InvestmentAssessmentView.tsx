@@ -10,6 +10,8 @@ import {
 import { ProvenanceBadge } from '../common/ProvenanceBadge';
 import { DecisionTimelineView } from './DecisionTimelineView';
 import { MultiPeerComparisonView } from './MultiPeerComparisonView';
+import { InvestmentEventsView } from './InvestmentEventsView';
+import { CounterfactualDecisionView } from './CounterfactualDecisionView';
 import {
   ShieldAlert,
   ShieldCheck,
@@ -32,8 +34,16 @@ import {
   ExternalLink,
   Copy,
   Check,
-  AlertOctagon
+  AlertOctagon,
+  Sparkles,
+  GitFork,
+  History,
+  ListTodo,
+  Database
 } from 'lucide-react';
+import { ResearchMemoryView } from '../memory/ResearchMemoryView';
+import { ResearchInvestigationView } from '../investigation/ResearchInvestigationView';
+import { EvidenceCollectionView } from '../evidence/EvidenceCollectionView';
 
 interface InvestmentAssessmentViewProps {
   stock: Stock;
@@ -58,7 +68,7 @@ export const InvestmentAssessmentView: React.FC<InvestmentAssessmentViewProps> =
   const [copiedId, setCopiedId] = useState<boolean>(false);
 
   // Security Comparison State
-  const [activeSubTab, setActiveSubTab] = useState<'assessment' | 'timeline' | 'peerGrid'>('assessment');
+  const [activeSubTab, setActiveSubTab] = useState<'assessment' | 'timeline' | 'events' | 'peerGrid' | 'counterfactual' | 'memory' | 'investigation' | 'evidence'>('assessment');
   const [compareTarget, setCompareTarget] = useState<string>('');
   const [comparison, setComparison] = useState<SecurityDecisionComparison | null>(null);
   const [comparing, setComparing] = useState<boolean>(false);
@@ -240,6 +250,18 @@ export const InvestmentAssessmentView: React.FC<InvestmentAssessmentViewProps> =
         </button>
 
         <button
+          onClick={() => setActiveSubTab('events')}
+          className={`px-3.5 py-2 rounded-sm border transition-colors flex items-center gap-2 ${
+            activeSubTab === 'events'
+              ? 'bg-[#0d1e30] border-[#38bdf8] text-[#38bdf8] font-bold'
+              : 'bg-[#06121e] border-[#1c2b3c] text-[#87929a] hover:text-white hover:border-[#38bdf8]/40'
+          }`}
+        >
+          <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
+          <span>Events & Thesis Impact</span>
+        </button>
+
+        <button
           onClick={() => setActiveSubTab('peerGrid')}
           className={`px-3.5 py-2 rounded-sm border transition-colors flex items-center gap-2 ${
             activeSubTab === 'peerGrid'
@@ -250,11 +272,105 @@ export const InvestmentAssessmentView: React.FC<InvestmentAssessmentViewProps> =
           <Scale className="w-3.5 h-3.5" />
           <span>Multi-Company Peer Valuation Grid</span>
         </button>
+
+        <button
+          onClick={() => setActiveSubTab('counterfactual')}
+          className={`px-3.5 py-2 rounded-sm border transition-colors flex items-center gap-2 ${
+            activeSubTab === 'counterfactual'
+              ? 'bg-[#0d1e30] border-[#38bdf8] text-[#38bdf8] font-bold'
+              : 'bg-[#06121e] border-[#1c2b3c] text-[#87929a] hover:text-white hover:border-[#38bdf8]/40'
+          }`}
+        >
+          <GitFork className="w-3.5 h-3.5 text-cyan-400" />
+          <span>Counterfactual & Sensitivity Intel</span>
+        </button>
+
+        <button
+          onClick={() => setActiveSubTab('memory')}
+          className={`px-3.5 py-2 rounded-sm border transition-colors flex items-center gap-2 ${
+            activeSubTab === 'memory'
+              ? 'bg-[#0d1e30] border-[#38bdf8] text-[#38bdf8] font-bold'
+              : 'bg-[#06121e] border-[#1c2b3c] text-[#87929a] hover:text-white hover:border-[#38bdf8]/40'
+          }`}
+        >
+          <History className="w-3.5 h-3.5 text-amber-400" />
+          <span>Research Memory & Knowledge Continuity</span>
+        </button>
+
+        <button
+          onClick={() => setActiveSubTab('investigation')}
+          className={`px-3.5 py-2 rounded-sm border transition-colors flex items-center gap-2 ${
+            activeSubTab === 'investigation'
+              ? 'bg-[#0d1e30] border-[#38bdf8] text-[#38bdf8] font-bold'
+              : 'bg-[#06121e] border-[#1c2b3c] text-[#87929a] hover:text-white hover:border-[#38bdf8]/40'
+          }`}
+        >
+          <ListTodo className="w-3.5 h-3.5 text-indigo-400" />
+          <span>Investigation Planning (Phase 34)</span>
+        </button>
+
+        <button
+          onClick={() => setActiveSubTab('evidence')}
+          className={`px-3.5 py-2 rounded-sm border transition-colors flex items-center gap-2 ${
+            activeSubTab === 'evidence'
+              ? 'bg-[#0d1e30] border-[#38bdf8] text-[#38bdf8] font-bold'
+              : 'bg-[#06121e] border-[#1c2b3c] text-[#87929a] hover:text-white hover:border-[#38bdf8]/40'
+          }`}
+        >
+          <Database className="w-3.5 h-3.5 text-emerald-400" />
+          <span>Evidence Ledger (Phase 35)</span>
+        </button>
       </div>
+
+      {/* SUB-TAB: EVIDENCE COLLECTION & EXECUTION LEDGER (PHASE 35) */}
+      {activeSubTab === 'evidence' && (
+        <EvidenceCollectionView
+          initialSecurityId={stock.canonicalId || stock.id || stock.ticker}
+          onSelectStock={onSelectTicker}
+          onOpenEvidence={onOpenEvidence ? (ev: any) => onOpenEvidence(ev.id || ev.evidenceId) : undefined}
+        />
+      )}
+
+      {/* SUB-TAB: RESEARCH INVESTIGATION & PLANNING (PHASE 34) */}
+      {activeSubTab === 'investigation' && (
+        <ResearchInvestigationView
+          initialSecurityId={stock.canonicalId || stock.id || stock.ticker}
+          onSelectStock={onSelectTicker}
+          onOpenEvidence={onOpenEvidence ? (ev: any) => onOpenEvidence(ev.id || ev.evidenceId) : undefined}
+        />
+      )}
+
+      {/* SUB-TAB: RESEARCH MEMORY & KNOWLEDGE CONTINUITY (PHASE 33) */}
+      {activeSubTab === 'memory' && (
+        <ResearchMemoryView
+          initialSecurityId={stock.canonicalId || stock.id || stock.ticker}
+          onSelectStock={onSelectTicker}
+          onOpenEvidence={onOpenEvidence ? (ev: any) => onOpenEvidence(ev.id || ev.evidenceId) : undefined}
+        />
+      )}
+
+      {/* SUB-TAB: COUNTERFACTUAL & SENSITIVITY INTEL (PHASE 32) */}
+      {activeSubTab === 'counterfactual' && (
+        <CounterfactualDecisionView
+          initialSecurityId={stock.canonicalId || stock.id || stock.ticker}
+          onSelectStock={onSelectTicker}
+          onOpenEvidence={onOpenEvidence ? (ev: any) => onOpenEvidence(ev.id || ev.evidenceId) : undefined}
+        />
+      )}
 
       {/* SUB-TAB 1: TIMELINE & DELTAS */}
       {activeSubTab === 'timeline' && (
         <DecisionTimelineView securityId={stock.ticker} />
+      )}
+
+      {/* SUB-TAB: EVENTS & THESIS IMPACT (PHASE 24) */}
+      {activeSubTab === 'events' && (
+        <InvestmentEventsView
+          securityId={stock.canonicalId || stock.id || (stock.market === 'INDIA' ? `in-${stock.ticker.toLowerCase()}` : `us-${stock.ticker.toLowerCase()}`)}
+          ticker={stock.ticker}
+          market={stock.market}
+          onOpenEvidence={onOpenEvidence}
+        />
       )}
 
       {/* SUB-TAB 2: MULTI-PEER GRID */}

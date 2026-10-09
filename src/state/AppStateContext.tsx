@@ -382,7 +382,7 @@ export const AppStateProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   }, []);
 
   // 7. Global Navigation & Selected Stock
-  const [currentScreen, setCurrentScreen] = useState<ActiveScreen>('dashboard');
+  const [currentScreen, setCurrentScreen] = useState<ActiveScreen>('command-center');
   const [selectedSecurityId, setSelectedSecurityId] = useState<string>('us-nvda');
   const [selectedTicker, setSelectedTicker] = useState<string>('NVDA');
   const [activeResearchContext, setActiveResearchContext] = useState<{

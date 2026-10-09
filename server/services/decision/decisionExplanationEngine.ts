@@ -11,12 +11,13 @@
  */
 
 import { GoogleGenAI } from '@google/genai';
+import { aiCircuitBreaker } from '../ai/aiCircuitBreaker';
 import { InvestmentDecisionAssessment } from '../../../src/types';
 
 export class DecisionExplanationEngine {
   private static instance: DecisionExplanationEngine;
   private aiClient: GoogleGenAI | null = null;
-  private readonly modelName = 'gemini-2.5-flash';
+  private readonly modelName = aiCircuitBreaker.getModelName();
 
   public static getInstance(): DecisionExplanationEngine {
     if (!DecisionExplanationEngine.instance) {
@@ -39,6 +40,10 @@ export class DecisionExplanationEngine {
    * Enriches an assessment's explanation using Gemini or clean deterministic fallback.
    */
   public async enrichExplanation(assessment: InvestmentDecisionAssessment): Promise<InvestmentDecisionAssessment['explanation']> {
+    if (!aiCircuitBreaker.canExecuteAi()) {
+      return this.generateDeterministicFallback(assessment);
+    }
+
     const client = this.getClient();
     if (!client) {
       return this.generateDeterministicFallback(assessment);
@@ -56,11 +61,12 @@ export class DecisionExplanationEngine {
         return this.generateDeterministicFallback(assessment);
       }
 
+      aiCircuitBreaker.recordSuccess();
+
       // Parse structured sections from Gemini or fallback gracefully
       return this.parseGeminiExplanation(text, assessment);
     } catch (err: unknown) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      console.warn(`[DecisionExplanationEngine] Gemini enrichment bypassed: ${errorMsg}`);
+      aiCircuitBreaker.handleAiError('DecisionExplanationEngine', err);
       return this.generateDeterministicFallback(assessment);
     }
   }

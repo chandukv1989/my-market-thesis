@@ -678,8 +678,16 @@ export function searchSecurities(
   }
 
   // 2. Exact Canonical ID (score 95)
+  const normCandidate = candidateLower.replace(/^sec[-_]/, '');
   for (const s of pool) {
-    if (s.id.toLowerCase() === candidateLower || s.id.toLowerCase() === `us-${candidateLower}` || s.id.toLowerCase() === `in-${candidateLower}`) {
+    if (
+      s.id.toLowerCase() === candidateLower ||
+      s.id.toLowerCase() === `us-${candidateLower}` ||
+      s.id.toLowerCase() === `in-${candidateLower}` ||
+      s.id.toLowerCase() === `us-${normCandidate}` ||
+      s.id.toLowerCase() === `in-${normCandidate}` ||
+      s.symbol.toLowerCase() === normCandidate
+    ) {
       addMatch(s, 'EXACT_CANONICAL_SYMBOL', 95);
     }
   }
@@ -765,3 +773,5 @@ export function resolveSecurity(
 
   return matches[0].security;
 }
+
+export const canonicalSecurities = CANONICAL_SECURITIES;

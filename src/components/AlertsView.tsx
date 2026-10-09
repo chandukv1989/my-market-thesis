@@ -16,8 +16,10 @@ import {
   CheckCircle2,
   SlidersHorizontal,
   Clock,
-  ExternalLink
+  ExternalLink,
+  Activity
 } from 'lucide-react';
+import { ContinuousAlertOrchestrationPanel } from './monitor/ContinuousAlertOrchestrationPanel';
 
 interface AlertsViewProps {
   alerts: AlertItem[];
@@ -36,7 +38,7 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
   onOpenEvidence,
   onNavigate
 }) => {
-  const [activeTab, setActiveTab] = useState<'events' | 'disclosures' | 'rules'>('events');
+  const [activeTab, setActiveTab] = useState<'orchestration' | 'events' | 'disclosures' | 'rules'>('orchestration');
   const [liveEvents, setLiveEvents] = useState<AlertEvent[]>([]);
   const [activeRules, setActiveRules] = useState<AlertRule[]>([]);
   const [isEvaluating, setIsEvaluating] = useState(false);
@@ -158,10 +160,22 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
       </div>
 
       {/* Tabs */}
-      <div className="flex items-center gap-2 border-b border-[#1c2b3c] pb-2 font-mono-data text-xs">
+      <div className="flex items-center gap-2 border-b border-[#1c2b3c] pb-2 font-mono-data text-xs overflow-x-auto">
+        <button
+          onClick={() => setActiveTab('orchestration')}
+          className={`px-3 py-1.5 rounded-xs transition-colors font-semibold flex items-center gap-1.5 shrink-0 ${
+            activeTab === 'orchestration'
+              ? 'bg-[#10b981] text-[#051424]'
+              : 'bg-[#090d14] text-[#87929a] hover:text-[#d4e4fa] border border-[#1c2b3c]'
+          }`}
+        >
+          <Activity className="w-3.5 h-3.5" />
+          <span>Continuous Orchestration (Phase 27)</span>
+        </button>
+
         <button
           onClick={() => setActiveTab('events')}
-          className={`px-3 py-1.5 rounded-xs transition-colors font-semibold flex items-center gap-1.5 ${
+          className={`px-3 py-1.5 rounded-xs transition-colors font-semibold flex items-center gap-1.5 shrink-0 ${
             activeTab === 'events'
               ? 'bg-[#38bdf8] text-[#051424]'
               : 'bg-[#090d14] text-[#87929a] hover:text-[#d4e4fa] border border-[#1c2b3c]'
@@ -173,7 +187,7 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
 
         <button
           onClick={() => setActiveTab('rules')}
-          className={`px-3 py-1.5 rounded-xs transition-colors font-semibold flex items-center gap-1.5 ${
+          className={`px-3 py-1.5 rounded-xs transition-colors font-semibold flex items-center gap-1.5 shrink-0 ${
             activeTab === 'rules'
               ? 'bg-[#38bdf8] text-[#051424]'
               : 'bg-[#090d14] text-[#87929a] hover:text-[#d4e4fa] border border-[#1c2b3c]'
@@ -185,7 +199,7 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
 
         <button
           onClick={() => setActiveTab('disclosures')}
-          className={`px-3 py-1.5 rounded-xs transition-colors font-semibold flex items-center gap-1.5 ${
+          className={`px-3 py-1.5 rounded-xs transition-colors font-semibold flex items-center gap-1.5 shrink-0 ${
             activeTab === 'disclosures'
               ? 'bg-[#38bdf8] text-[#051424]'
               : 'bg-[#090d14] text-[#87929a] hover:text-[#d4e4fa] border border-[#1c2b3c]'
@@ -195,6 +209,13 @@ export const AlertsView: React.FC<AlertsViewProps> = ({
           <span>SEC Disclosures ({alerts.length})</span>
         </button>
       </div>
+
+      {/* TAB 0: CONTINUOUS ALERT ORCHESTRATION */}
+      {activeTab === 'orchestration' && (
+        <ContinuousAlertOrchestrationPanel
+          onOpenReviewForMonitor={(_monitorId) => onNavigate('monitor')}
+        />
+      )}
 
       {/* TAB 1: LIVE DETERMINISTIC EVENTS */}
       {activeTab === 'events' && (

@@ -17,6 +17,15 @@ import { BacktestingView } from './components/BacktestingView';
 import { WatchlistView } from './components/WatchlistView';
 import { AlertsView } from './components/AlertsView';
 import { ResearchWorkspaceView } from './components/ResearchWorkspaceView';
+import { InvestmentMonitorView } from './components/monitor/InvestmentMonitorView';
+import { CommandCenterView } from './components/CommandCenterView';
+import { CrossInvestmentView } from './components/CrossInvestmentView';
+import { PortfolioScenarioView } from './components/scenarios/PortfolioScenarioView';
+import { CounterfactualDecisionView } from './components/decision/CounterfactualDecisionView';
+import { ResearchMemoryView } from './components/memory/ResearchMemoryView';
+import { ResearchInvestigationView } from './components/investigation/ResearchInvestigationView';
+import { EvidenceCollectionView } from './components/evidence/EvidenceCollectionView';
+import { PilotReadinessView } from './components/pilot/PilotReadinessView';
 
 function TerminalShell() {
   const {
@@ -75,6 +84,72 @@ function TerminalShell() {
 
         {/* Dynamic View Canvas with custom dark scrollbar */}
         <main className="flex-1 overflow-y-auto bg-[#051424]">
+          {currentScreen === 'pilot-readiness' && (
+            <PilotReadinessView
+              onNavigate={setCurrentScreen}
+              onSelectStock={handleSelectStock}
+            />
+          )}
+
+          {currentScreen === 'command-center' && (
+            <CommandCenterView
+              onNavigate={setCurrentScreen}
+              onSelectStock={handleSelectStock}
+              onOpenEvidence={setActiveEvidence}
+            />
+          )}
+
+          {currentScreen === 'cross-investment' && (
+            <CrossInvestmentView
+              onNavigate={setCurrentScreen}
+              onSelectStock={handleSelectStock}
+              onOpenEvidence={setActiveEvidence}
+            />
+          )}
+
+          {currentScreen === 'scenario-intelligence' && (
+            <PortfolioScenarioView
+              onNavigate={setCurrentScreen}
+              onSelectStock={handleSelectStock}
+              onOpenEvidence={setActiveEvidence}
+            />
+          )}
+
+          {currentScreen === 'counterfactual-intelligence' && (
+            <CounterfactualDecisionView
+              onNavigate={setCurrentScreen}
+              onSelectStock={handleSelectStock}
+              onOpenEvidence={setActiveEvidence}
+            />
+          )}
+
+          {currentScreen === 'research-memory' && (
+            <ResearchMemoryView
+              initialSecurityId={currentStock?.ticker}
+              onNavigate={setCurrentScreen}
+              onSelectStock={handleSelectStock}
+              onOpenEvidence={setActiveEvidence}
+            />
+          )}
+
+          {currentScreen === 'investigation-planning' && (
+            <ResearchInvestigationView
+              initialSecurityId={currentStock?.ticker}
+              onNavigate={setCurrentScreen}
+              onSelectStock={handleSelectStock}
+              onOpenEvidence={setActiveEvidence}
+            />
+          )}
+
+          {currentScreen === 'evidence-ledger' && (
+            <EvidenceCollectionView
+              initialSecurityId={currentStock?.ticker}
+              onNavigate={setCurrentScreen}
+              onSelectStock={handleSelectStock}
+              onOpenEvidence={setActiveEvidence}
+            />
+          )}
+
           {currentScreen === 'dashboard' && (
             <DashboardView
               portfolio={portfolio}
@@ -165,6 +240,15 @@ function TerminalShell() {
               onSelectStock={handleSelectStock}
               stocks={securitiesList}
               activeResearchContext={activeResearchContext}
+              portfolio={portfolio}
+            />
+          )}
+
+          {currentScreen === 'monitor' && (
+            <InvestmentMonitorView
+              onSelectStock={handleSelectStock}
+              onOpenEvidence={setActiveEvidence}
+              allStocks={securitiesList}
               portfolio={portfolio}
             />
           )}

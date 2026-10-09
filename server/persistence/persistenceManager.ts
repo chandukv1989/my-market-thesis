@@ -127,6 +127,24 @@ export class PersistenceManager {
   public getUserRepository() { return this.getAdapter().getUserRepository(); }
   public getSessionRepository() { return this.getAdapter().getSessionRepository(); }
   public getEventRepository() { return this.getAdapter().getEventRepository(); }
+  public getMonitorRepository() { return this.getAdapter().getMonitorRepository(); }
+  public getMonitorReviewRepository() { return this.getAdapter().getMonitorReviewRepository(); }
+  public getInvestmentMonitorRepository() { return this.getAdapter().getMonitorRepository(); }
+  public getInvestmentMonitorReviewRepository() { return this.getAdapter().getMonitorReviewRepository(); }
+  public getPolicyRepository() { return this.getAdapter().getPolicyRepository(); }
+  public getAlertOrchestrationRepository() { return this.getAdapter().getAlertOrchestrationRepository(); }
+  public getResearchPriorityRepository() { return this.getAdapter().getResearchPriorityRepository(); }
+  public getCrossInvestmentSnapshotRepository() { return this.getAdapter().getCrossInvestmentSnapshotRepository(); }
+  public getPortfolioScenarioRepository() { return this.getAdapter().getPortfolioScenarioRepository(); }
+  public getCounterfactualRepository() { return this.getAdapter().getCounterfactualRepository(); }
+  public getResearchMemoryRepository() { return this.getAdapter().getResearchMemoryRepository(); }
+  public getResearchQuestionRepository() { return this.getAdapter().getResearchQuestionRepository(); }
+  public getResearchGapRepository() { return this.getAdapter().getResearchGapRepository(); }
+  public getInvestigationPlanRepository() { return this.getAdapter().getInvestigationPlanRepository(); }
+  public getInvestigationAuditRepository() { return this.getAdapter().getInvestigationAuditRepository(); }
+  public getEvidenceCollectionRepository() { return this.getAdapter().getEvidenceCollectionRepository(); }
+  public getEvidenceRelationshipRepository() { return this.getAdapter().getEvidenceRelationshipRepository(); }
+  public getEvidenceAuditRepository() { return this.getAdapter().getEvidenceAuditRepository(); }
   public runTransaction<T>(work: () => Promise<T>): Promise<T> {
     return this.getAdapter().runTransaction(work);
   }

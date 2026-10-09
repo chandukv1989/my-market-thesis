@@ -20,7 +20,24 @@ import {
   IPortfolioRepository,
   IResearchQueryRepository,
   IUserRepository,
-  ISessionRepository
+  ISessionRepository,
+  IInvestmentEventRepository,
+  IInvestmentMonitorRepository,
+  IInvestmentMonitorReviewRepository,
+  IMonitoringPolicyRepository,
+  IAlertOrchestrationRepository,
+  IResearchPriorityRepository,
+  ICrossInvestmentSnapshotRepository,
+  IPortfolioScenarioRepository,
+  ICounterfactualRepository,
+  IResearchMemoryRepository,
+  IResearchQuestionRepository,
+  IResearchGapRepository,
+  IInvestigationPlanRepository,
+  IInvestigationAuditRepository,
+  IEvidenceCollectionRepository,
+  IEvidenceRelationshipRepository,
+  IEvidenceAuditRepository
 } from '../types';
 import {
   PersistenceStatusResponse,
@@ -43,7 +60,24 @@ import {
   PostgresPortfolioRepository,
   PostgresResearchQueryRepository,
   PostgresUserRepository,
-  PostgresSessionRepository
+  PostgresSessionRepository,
+  PostgresInvestmentEventRepository,
+  PostgresInvestmentMonitorRepository,
+  PostgresInvestmentMonitorReviewRepository,
+  PostgresMonitoringPolicyRepository,
+  PostgresAlertOrchestrationRepository,
+  PostgresResearchPriorityRepository,
+  PostgresCrossInvestmentSnapshotRepository,
+  PostgresPortfolioScenarioRepository,
+  PostgresCounterfactualRepository,
+  PostgresResearchMemoryRepository,
+  PostgresResearchQuestionRepository,
+  PostgresResearchGapRepository,
+  PostgresInvestigationPlanRepository,
+  PostgresInvestigationAuditRepository,
+  PostgresEvidenceCollectionRepository,
+  PostgresEvidenceRelationshipRepository,
+  PostgresEvidenceAuditRepository
 } from './postgresRepositories';
 import { getDatabaseConfig } from '../databaseConfig';
 
@@ -69,6 +103,23 @@ export class PostgresPersistenceAdapter implements IPersistenceAdapter {
   private queryRepo!: IResearchQueryRepository;
   private userRepo!: IUserRepository;
   private sessionRepo!: ISessionRepository;
+  private eventRepo!: IInvestmentEventRepository;
+  private monitorRepo!: IInvestmentMonitorRepository;
+  private monitorReviewRepo!: IInvestmentMonitorReviewRepository;
+  private policyRepo!: IMonitoringPolicyRepository;
+  private alertOrchestrationRepo!: IAlertOrchestrationRepository;
+  private researchPriorityRepo!: IResearchPriorityRepository;
+  private crossInvestmentSnapshotRepo!: ICrossInvestmentSnapshotRepository;
+  private portfolioScenarioRepo!: IPortfolioScenarioRepository;
+  private counterfactualRepo!: ICounterfactualRepository;
+  private researchMemoryRepo!: IResearchMemoryRepository;
+  private researchQuestionRepo!: IResearchQuestionRepository;
+  private researchGapRepo!: IResearchGapRepository;
+  private investigationPlanRepo!: IInvestigationPlanRepository;
+  private investigationAuditRepo!: IInvestigationAuditRepository;
+  private evidenceCollectionRepo!: IEvidenceCollectionRepository;
+  private evidenceRelationshipRepo!: IEvidenceRelationshipRepository;
+  private evidenceAuditRepo!: IEvidenceAuditRepository;
 
   constructor(client?: PostgresClient) {
     this.client = client || new PostgresClient();
@@ -104,6 +155,23 @@ export class PostgresPersistenceAdapter implements IPersistenceAdapter {
     this.queryRepo = new PostgresResearchQueryRepository(this.client);
     this.userRepo = new PostgresUserRepository(this.client);
     this.sessionRepo = new PostgresSessionRepository(this.client);
+    this.eventRepo = new PostgresInvestmentEventRepository(this.client);
+    this.monitorRepo = new PostgresInvestmentMonitorRepository(this.client);
+    this.monitorReviewRepo = new PostgresInvestmentMonitorReviewRepository(this.client);
+    this.policyRepo = new PostgresMonitoringPolicyRepository(this.client);
+    this.alertOrchestrationRepo = new PostgresAlertOrchestrationRepository(this.client);
+    this.researchPriorityRepo = new PostgresResearchPriorityRepository(this.client);
+    this.crossInvestmentSnapshotRepo = new PostgresCrossInvestmentSnapshotRepository(this.client);
+    this.portfolioScenarioRepo = new PostgresPortfolioScenarioRepository(this.client);
+    this.counterfactualRepo = new PostgresCounterfactualRepository(this.client);
+    this.researchMemoryRepo = new PostgresResearchMemoryRepository(this.client);
+    this.researchQuestionRepo = new PostgresResearchQuestionRepository(this.client);
+    this.researchGapRepo = new PostgresResearchGapRepository(this.client);
+    this.investigationPlanRepo = new PostgresInvestigationPlanRepository(this.client);
+    this.investigationAuditRepo = new PostgresInvestigationAuditRepository(this.client);
+    this.evidenceCollectionRepo = new PostgresEvidenceCollectionRepository(this.client);
+    this.evidenceRelationshipRepo = new PostgresEvidenceRelationshipRepository(this.client);
+    this.evidenceAuditRepo = new PostgresEvidenceAuditRepository(this.client);
   }
 
   public async shutdown(): Promise<void> {
@@ -134,11 +202,28 @@ export class PostgresPersistenceAdapter implements IPersistenceAdapter {
   public getQueryRepository(): IResearchQueryRepository { return this.queryRepo; }
   public getUserRepository(): IUserRepository { return this.userRepo; }
   public getSessionRepository(): ISessionRepository { return this.sessionRepo; }
+  public getEventRepository(): IInvestmentEventRepository { return this.eventRepo; }
+  public getMonitorRepository(): IInvestmentMonitorRepository { return this.monitorRepo; }
+  public getMonitorReviewRepository(): IInvestmentMonitorReviewRepository { return this.monitorReviewRepo; }
+  public getPolicyRepository(): IMonitoringPolicyRepository { return this.policyRepo; }
+  public getAlertOrchestrationRepository(): IAlertOrchestrationRepository { return this.alertOrchestrationRepo; }
+  public getResearchPriorityRepository(): IResearchPriorityRepository { return this.researchPriorityRepo; }
+  public getCrossInvestmentSnapshotRepository(): ICrossInvestmentSnapshotRepository { return this.crossInvestmentSnapshotRepo; }
+  public getPortfolioScenarioRepository(): IPortfolioScenarioRepository { return this.portfolioScenarioRepo; }
+  public getCounterfactualRepository(): ICounterfactualRepository { return this.counterfactualRepo; }
+  public getResearchMemoryRepository(): IResearchMemoryRepository { return this.researchMemoryRepo; }
+  public getResearchQuestionRepository(): IResearchQuestionRepository { return this.researchQuestionRepo; }
+  public getResearchGapRepository(): IResearchGapRepository { return this.researchGapRepo; }
+  public getInvestigationPlanRepository(): IInvestigationPlanRepository { return this.investigationPlanRepo; }
+  public getInvestigationAuditRepository(): IInvestigationAuditRepository { return this.investigationAuditRepo; }
+  public getEvidenceCollectionRepository(): IEvidenceCollectionRepository { return this.evidenceCollectionRepo; }
+  public getEvidenceRelationshipRepository(): IEvidenceRelationshipRepository { return this.evidenceRelationshipRepo; }
+  public getEvidenceAuditRepository(): IEvidenceAuditRepository { return this.evidenceAuditRepo; }
 
   public async getStatus(): Promise<PersistenceStatusResponse> {
     const config = getDatabaseConfig();
 
-    let counts = {
+    let counts: any = {
       securities: 0,
       documents: 0,
       evidence: 0,
@@ -148,7 +233,13 @@ export class PostgresPersistenceAdapter implements IPersistenceAdapter {
       strategies: 0,
       backtests: 0,
       alerts: 0,
-      queries: 0
+      queries: 0,
+      events: 0,
+      monitors: 0,
+      reviews: 0,
+      policies: 0,
+      orchestratedAlerts: 0,
+      researchPriorities: 0
     };
 
     if (this.isConnected) {
@@ -163,7 +254,13 @@ export class PostgresPersistenceAdapter implements IPersistenceAdapter {
           strategies,
           backtests,
           alerts,
-          queries
+          queries,
+          events,
+          monitors,
+          reviews,
+          policies,
+          orchestratedAlerts,
+          researchPriorities
         ] = await Promise.all([
           this.securityRepo.count(),
           this.documentRepo.count(),
@@ -174,9 +271,32 @@ export class PostgresPersistenceAdapter implements IPersistenceAdapter {
           this.strategyRepo.count(),
           this.backtestRepo.count(),
           this.alertRepo.count(),
-          this.queryRepo.count()
+          this.queryRepo.count(),
+          this.eventRepo.count(),
+          this.monitorRepo ? this.monitorRepo.count() : 0,
+          this.monitorReviewRepo ? this.monitorReviewRepo.count() : 0,
+          this.policyRepo ? this.policyRepo.count() : 0,
+          this.alertOrchestrationRepo ? this.alertOrchestrationRepo.count() : 0,
+          this.researchPriorityRepo ? this.researchPriorityRepo.count() : 0
         ]);
-        counts = { securities, documents, evidence, notebooks, snapshots, decisions, strategies, backtests, alerts, queries };
+        counts = {
+          securities,
+          documents,
+          evidence,
+          notebooks,
+          snapshots,
+          decisions,
+          strategies,
+          backtests,
+          alerts,
+          queries,
+          events,
+          monitors,
+          reviews,
+          policies,
+          orchestratedAlerts,
+          researchPriorities
+        };
       } catch (err) {
         console.error('[PostgresPersistenceAdapter] Failed to gather counts:', err);
       }

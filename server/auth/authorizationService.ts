@@ -9,7 +9,7 @@ import { persistenceManager } from '../persistence/persistenceManager';
 import { watchlistAlertService } from '../services/alerts/watchlistAlertService';
 import { quantStrategyEngine } from '../services/quant/quantStrategyEngine';
 import { backtestService } from '../services/backtest/backtestService';
-import { ResearchDocument, ResearchNotebook, ResearchSnapshot, InvestmentDecisionAssessment, Strategy, QuantStrategy, BacktestResult, AlertItem, CanonicalWatchlistItem, AlertRule, AlertEvent } from '../../src/types';
+import { ResearchDocument, ResearchNotebook, ResearchSnapshot, InvestmentDecisionAssessment, Strategy, QuantStrategy, BacktestResult, AlertItem, CanonicalWatchlistItem, AlertRule, AlertEvent, InvestmentMonitor, MonitoringPolicy, AlertInstance, ResearchPrioritySnapshot } from '../../src/types';
 
 export class AuthorizationError extends Error {
   constructor(message: string = 'Access denied: You do not own this resource', public statusCode: number = 403) {
@@ -230,6 +230,77 @@ export class AuthorizationService {
     }
 
     return event;
+  }
+
+  /**
+   * Verify monitor ownership.
+   */
+  public async authorizeMonitor(monitorId: string, userId: string): Promise<InvestmentMonitor> {
+    const monitorRepo = persistenceManager.getMonitorRepository();
+    const monitor = await monitorRepo.get(monitorId);
+    if (!monitor) {
+      throw new AuthorizationError('Monitor not found', 404);
+    }
+
+    const owner = monitor.ownerUserId || monitor.userId;
+    if (owner && owner !== userId) {
+      throw new AuthorizationError('Access denied: You do not own this monitor', 403);
+    }
+
+    return monitor;
+  }
+
+  /**
+   * Verify monitoring policy ownership.
+   */
+  public async authorizePolicy(policyId: string, userId: string): Promise<MonitoringPolicy> {
+    const policyRepo = persistenceManager.getPolicyRepository();
+    const policy = await policyRepo.get(policyId);
+    if (!policy) {
+      throw new AuthorizationError('Monitoring policy not found', 404);
+    }
+
+    const owner = policy.ownerUserId || policy.userId;
+    if (owner && owner !== userId) {
+      throw new AuthorizationError('Access denied: You do not own this monitoring policy', 403);
+    }
+
+    return policy;
+  }
+
+  /**
+   * Verify orchestrated alert ownership.
+   */
+  public async authorizeOrchestratedAlert(alertId: string, userId: string): Promise<AlertInstance> {
+    const alertRepo = persistenceManager.getAlertOrchestrationRepository();
+    const alert = await alertRepo.get(alertId);
+    if (!alert) {
+      throw new AuthorizationError('Orchestrated alert not found', 404);
+    }
+
+    const owner = alert.ownerUserId || alert.userId;
+    if (owner && owner !== userId) {
+      throw new AuthorizationError('Access denied: You do not own this orchestrated alert', 403);
+    }
+
+    return alert;
+  }
+
+  /**
+   * Verify research priority snapshot ownership.
+   */
+  public async authorizeResearchPrioritySnapshot(snapshotId: string, userId: string): Promise<ResearchPrioritySnapshot> {
+    const priorityRepo = persistenceManager.getResearchPriorityRepository();
+    const snapshot = await priorityRepo.getSnapshot(snapshotId);
+    if (!snapshot) {
+      throw new AuthorizationError('Research priority snapshot not found', 404);
+    }
+
+    if (snapshot.userId !== userId) {
+      throw new AuthorizationError('Access denied: You do not own this research priority snapshot', 403);
+    }
+
+    return snapshot;
   }
 }
 

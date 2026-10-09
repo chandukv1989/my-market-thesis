@@ -331,6 +331,7 @@ export class USMarketProvider implements RegionalMarketProvider {
         market: 'US',
         exchange: data.exchange || exchange,
         asOf: data.datetime || now,
+        timestamp: data.datetime || now,
         retrievedAt: now,
         provider: 'Twelve Data',
         isSimulated: false,
