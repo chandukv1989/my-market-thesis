@@ -342,9 +342,17 @@ export const WatchlistView: React.FC<WatchlistViewProps> = ({
                         <span className="text-[10px] text-[#bdc8d1] font-medium">
                           {stock.market === 'INDIA' ? 'FYERS (India)' : 'Twelve Data (US)'}
                         </span>
-                        <span className="text-[9px] text-[#34d399] font-bold">
-                          VERIFIED
-                        </span>
+                        {stock.priceStatus === 'REAL' ? (
+                          <span className="text-[9px] text-[#34d399] font-bold" title={stock.priceAsOf ? `As of ${String(stock.priceAsOf).slice(0, 10)}` : undefined}>
+                            LIVE · {stock.priceAsOf ? String(stock.priceAsOf).slice(0, 10) : 'REAL'}
+                          </span>
+                        ) : stock.priceStatus === 'SIMULATED' ? (
+                          <span className="text-[9px] text-[#f59e0b] font-bold" title={stock.priceReason}>SIMULATED</span>
+                        ) : stock.priceStatus === 'UNAVAILABLE' ? (
+                          <span className="text-[9px] text-[#f43f5e] font-bold" title={stock.priceReason}>LIVE UNAVAILABLE</span>
+                        ) : (
+                          <span className="text-[9px] text-[#87929a] font-bold">SAMPLE (loading live…)</span>
+                        )}
                       </div>
                     </td>
 

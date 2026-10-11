@@ -20,6 +20,7 @@
  * - Native USD vs INR currency isolation.
  */
 
+import { latestDecisionVisibleTo, latestSnapshotVisibleTo, visibleToEngine } from '../../auth/engineScope';
 import {
   ResearchGapRecord,
   ResearchGapStatus,
@@ -326,7 +327,7 @@ export class ResearchGapDetectionService {
     // 4. Decision Dimension Deficit Check
     try {
       const decRepo = persistenceManager.getDecisionRepository();
-      const dec = await decRepo.getLatest(resolved.id, effectiveDate);
+      const dec = await latestDecisionVisibleTo(userId, resolved.id, effectiveDate);
       if (dec && dec.dimensionAssessments) {
         for (const [dimKey, dim] of Object.entries(dec.dimensionAssessments)) {
           if ((dim as any).epistemicStatus === 'UNAVAILABLE' || (dim as any).score === 0) {

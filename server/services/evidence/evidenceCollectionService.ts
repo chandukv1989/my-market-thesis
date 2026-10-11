@@ -182,7 +182,7 @@ export class EvidenceCollectionService {
 
     const cleanSec = resolved.id.replace(/[^a-z0-9]/gi, '_').toLowerCase();
     const cleanType = req.sourceType.toLowerCase();
-    const collectionId = `col_${cleanSec}_${cleanType}_${asOfDate.replace(/-/g, '')}_${contentHash.substring(0, 10)}`;
+    const collectionId = await this.freeCollectionId(`col_${cleanSec}_${cleanType}_${asOfDate.replace(/-/g, '')}_${contentHash.substring(0, 10)}`);
 
     const collectionStatus: CollectionStatus = req.collectionStatus || 'COLLECTED';
     const qualityGrade: EvidenceQualityGrade = req.qualityGrade || this.deriveQualityGrade(req.sourceType, collectionStatus);
@@ -265,6 +265,22 @@ export class EvidenceCollectionService {
     }
 
     return saved;
+  }
+
+  /**
+   * Collection ids are content-derived. Re-collecting identical content (for example after the earlier record was
+   * SUPERSEDED) would reuse an existing id; the immutable ledger must never overwrite history, so a numbered
+   * revision suffix is appended until the id is free. (The development adapter previously overwrote the earlier record
+   * silently; PostgreSQL-style stores reject duplicates, so the id must be unique by construction.)
+   */
+  private async freeCollectionId(base: string): Promise<string> {
+    const repo = persistenceManager.getEvidenceCollectionRepository();
+    if (!(await repo.get(base))) return base;
+    for (let rev = 2; rev < 1000; rev++) {
+      const candidate = `${base}_r${rev}`;
+      if (!(await repo.get(candidate))) return candidate;
+    }
+    throw new Error(`Unable to allocate a unique evidence collection id for ${base}.`);
   }
 
   /**
@@ -416,7 +432,7 @@ export class EvidenceCollectionService {
 
     const supersedingRecord: EvidenceCollectionRecord = {
       ...existing,
-      collectionId: `col_${existing.securityId.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_${existing.sourceType.toLowerCase()}_${asOf.replace(/-/g, '')}_${newContentHash.substring(0, 10)}`,
+      collectionId: await this.freeCollectionId(`col_${existing.securityId.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_${existing.sourceType.toLowerCase()}_${asOf.replace(/-/g, '')}_${newContentHash.substring(0, 10)}`),
       sourceTitle: req.sourceTitle || existing.sourceTitle,
       sourcePublisher: req.sourcePublisher || existing.sourcePublisher,
       sourceReference: req.sourceReference || existing.sourceReference,

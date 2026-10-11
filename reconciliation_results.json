@@ -8,7 +8,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 8637
+      "durationMs": 2301
     },
     {
       "suite": "Phase 21 Acceptance",
@@ -18,7 +18,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 10438
+      "durationMs": 3688
     },
     {
       "suite": "Phase 23",
@@ -28,7 +28,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 1716
+      "durationMs": 565
     },
     {
       "suite": "Phase 24",
@@ -38,7 +38,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 2595
+      "durationMs": 1288
     },
     {
       "suite": "Phase 25",
@@ -48,7 +48,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 5980
+      "durationMs": 1875
     },
     {
       "suite": "Phase 25 Acceptance",
@@ -58,7 +58,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 12074
+      "durationMs": 2823
     },
     {
       "suite": "Phase 26",
@@ -68,7 +68,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 8155
+      "durationMs": 2129
     },
     {
       "suite": "Phase 26.1 Acceptance",
@@ -78,7 +78,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 21293
+      "durationMs": 3842
     },
     {
       "suite": "Phase 27.1 Acceptance",
@@ -88,7 +88,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 27685
+      "durationMs": 5161
     },
     {
       "suite": "Phase 28 Acceptance",
@@ -98,7 +98,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 7579
+      "durationMs": 2315
     },
     {
       "suite": "Phase 28.1 Validation",
@@ -108,7 +108,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 21748
+      "durationMs": 4162
     },
     {
       "suite": "Phase 29 Acceptance",
@@ -118,7 +118,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 24190
+      "durationMs": 5000
     },
     {
       "suite": "Phase 30 Acceptance",
@@ -128,7 +128,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 5511
+      "durationMs": 2139
     },
     {
       "suite": "Phase 31 Acceptance",
@@ -138,7 +138,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 5430
+      "durationMs": 2787
     },
     {
       "suite": "Phase 32 Acceptance",
@@ -148,7 +148,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 6345
+      "durationMs": 4692
     },
     {
       "suite": "Phase 33 Acceptance",
@@ -158,7 +158,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 15149
+      "durationMs": 3775
     },
     {
       "suite": "Phase 34 Acceptance",
@@ -168,7 +168,7 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 49233
+      "durationMs": 12772
     },
     {
       "suite": "Phase 35 Acceptance",
@@ -178,31 +178,31 @@
       "failed": 0,
       "skipped": 0,
       "status": "PASSED",
-      "durationMs": 63517
+      "durationMs": 12595
     },
     {
       "suite": "Phase 36 Acceptance",
       "file": "tests/phase36_acceptance.test.ts",
       "discovered": 108,
-      "passed": 108,
-      "failed": 0,
+      "passed": 96,
+      "failed": 12,
       "skipped": 0,
-      "status": "PASSED",
-      "durationMs": 37289
+      "status": "FAILED",
+      "durationMs": 12688
     },
     {
       "suite": "Phase 37 Certification",
       "file": "tests/phase37_certification.test.ts",
-      "discovered": 1,
-      "passed": 0,
-      "failed": 1,
+      "discovered": 52,
+      "passed": 48,
+      "failed": 4,
       "skipped": 0,
       "status": "FAILED",
-      "durationMs": 38980
+      "durationMs": 10569
     }
   ],
-  "totalDiscovered": 715,
-  "totalPassed": 714,
-  "totalFailed": 1,
+  "totalDiscovered": 766,
+  "totalPassed": 750,
+  "totalFailed": 16,
   "totalSkipped": 0
 }

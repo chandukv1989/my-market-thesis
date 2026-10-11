@@ -22,6 +22,7 @@
  *  - Scenario R: Gemini Epistemic Boundary (LLM limited to narrative explanation, zero metric override)
  */
 
+import { classifyLegacyFixturesSharedForTest } from './helpers/legacyFixtures';
 import assert from 'node:assert';
 import { investmentMonitorEngine } from '../server/services/monitor/investmentMonitorEngine';
 import { persistenceManager } from '../server/persistence/persistenceManager';
@@ -58,6 +59,8 @@ async function runScenario(scenarioName: string, fn: () => void | Promise<void>)
 }
 
 async function runAllPhase26Acceptance() {
+  // Phase 38.2B: ownerless legacy fixtures are no longer implicitly visible; classify them explicitly (in-memory, test only).
+  await classifyLegacyFixturesSharedForTest();
   await persistenceManager.initialize();
   await investmentMonitorEngine.initialize();
 

@@ -15,6 +15,7 @@
  * - 3-run byte-identical determinism
  */
 
+import { classifyLegacyFixturesSharedForTest } from './helpers/legacyFixtures';
 import { portfolioScenarioService } from '../server/services/scenarios/portfolioScenarioService';
 import { persistenceManager } from '../server/persistence/persistenceManager';
 import { aiCircuitBreaker } from '../server/services/ai/aiCircuitBreaker';
@@ -46,6 +47,8 @@ function assert(condition: boolean, scenario: string, message: string) {
 }
 
 async function runPhase31AcceptanceTests() {
+  // Phase 38.2B: ownerless legacy fixtures are no longer implicitly visible; classify them explicitly (in-memory, test only).
+  await classifyLegacyFixturesSharedForTest();
   console.log('======================================================================');
   console.log('PHASE 31: PORTFOLIO SCENARIO & STRESS INTELLIGENCE ACCEPTANCE TEST SUITE');
   console.log('======================================================================');

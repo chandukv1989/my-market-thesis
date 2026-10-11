@@ -5,6 +5,8 @@
 
 import React, { useState } from 'react';
 import { AppStateProvider, useAppState } from './state/AppStateContext';
+import { AuthProvider, useAuth } from './state/AuthContext';
+import { AuthGate } from './components/auth/AuthGate';
 import { Header } from './components/Header';
 import { Sidebar } from './components/Sidebar';
 import { EvidenceModal } from './components/common/EvidenceModal';
@@ -55,6 +57,7 @@ function TerminalShell() {
   } = useAppState();
 
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const auth = useAuth();
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#051424] text-[#d4e4fa] antialiased selection:bg-[#38bdf8]/30 selection:text-[#38bdf8]">
@@ -77,6 +80,8 @@ function TerminalShell() {
           unreadAlertsCount={unreadAlertsCount}
           onSearchSubmit={handleSearchSubmit}
           onSelectStock={handleSelectStock}
+          userEmail={auth.user?.email}
+          onLogout={() => { void auth.logout(); }}
           portfolioNav={portfolio.nav}
           portfolioTodayChangePct={portfolio.todayChangePct}
           dataSourcesHealth={dataSourcesHealth}
@@ -265,9 +270,15 @@ function TerminalShell() {
 }
 
 export default function App() {
+  // Phase 38.2B: the data-bearing state provider (which fetches protected APIs on mount) only mounts once a session
+  // exists; sign-out unmounts it, discarding all per-user client state.
   return (
-    <AppStateProvider>
-      <TerminalShell />
-    </AppStateProvider>
+    <AuthProvider>
+      <AuthGate>
+        <AppStateProvider>
+          <TerminalShell />
+        </AppStateProvider>
+      </AuthGate>
+    </AuthProvider>
   );
 }

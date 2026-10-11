@@ -12,6 +12,7 @@
  * 4. Analytical only; zero automated broker order execution.
  */
 
+import { visibleToEngine } from '../../auth/engineScope';
 import { GoogleGenAI } from '@google/genai';
 import { aiCircuitBreaker } from '../ai/aiCircuitBreaker';
 import {
@@ -232,7 +233,8 @@ export class InvestmentEventEngine {
     const canonical = resolveSecurity(event.securityId);
     const targetId = canonical ? canonical.id : event.securityId;
 
-    const history = await decisionRepo.getHistory(targetId);
+    // Events are shared reference data: only SHARED decisions may inform them (no principal in scope).
+    const history = (await decisionRepo.getHistory(targetId)).filter(d => visibleToEngine(d, undefined));
     if (!history || history.length === 0) {
       return {
         hasSubsequentDecision: false,
@@ -419,7 +421,8 @@ export class InvestmentEventEngine {
     const targetId = canonical ? canonical.id : event.securityId;
 
     try {
-      const history = await notebookService.getSnapshots(targetId);
+      // Events are shared reference data: only explicitly SHARED snapshots may inform them (Phase 38.2D).
+      const history = notebookService.getSnapshots(notebookService.notebookIdFor(targetId)).filter(sn => visibleToEngine(sn, undefined));
       if (!history || history.length === 0) {
         return {
           hasSnapshotComparison: false,

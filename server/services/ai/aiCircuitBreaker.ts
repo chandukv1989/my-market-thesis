@@ -73,7 +73,18 @@ export class AiCircuitBreaker {
    * Prevents raw error dumps and alerts downstream services to switch to deterministic fallback.
    */
   public handleAiError(serviceName: string, err: unknown): { isQuotaIssue: boolean; reason: string } {
-    const rawMsg = err instanceof Error ? err.message : String(err);
+    let rawMsg = '';
+    if (err instanceof Error) {
+      rawMsg = err.message;
+    } else if (typeof err === 'object' && err !== null) {
+      try {
+        rawMsg = JSON.stringify(err);
+      } catch {
+        rawMsg = String(err);
+      }
+    } else {
+      rawMsg = String(err);
+    }
     const isPrepayment =
       rawMsg.includes('402') ||
       rawMsg.toLowerCase().includes('prepayment') ||

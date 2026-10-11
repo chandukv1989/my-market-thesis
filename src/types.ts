@@ -104,6 +104,11 @@ export interface FinancialQuarter {
 }
 
 export interface Stock {
+  // Live price provenance. Undefined/'SAMPLE' means `price` is a built-in sample value, NOT a market quote.
+  priceStatus?: 'REAL' | 'SIMULATED' | 'UNAVAILABLE' | 'SAMPLE';
+  priceProvider?: string;
+  priceAsOf?: string;
+  priceReason?: string;
   // Canonical Security Identifiers
   id?: string;
   symbol?: string;
@@ -330,6 +335,7 @@ export interface BacktestResult {
   strategyId?: string;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
   strategyTitle?: string;
   strategyVersion?: string;
   configuration?: BacktestConfiguration;
@@ -575,6 +581,7 @@ export interface Strategy {
   rules: StrategyRule[];
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
   isBuiltIn?: boolean;
   lastRun?: string;
   backtestId?: string;
@@ -603,6 +610,7 @@ export interface HoldingPosition {
   exchange?: string;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
   positionId?: string;
   portfolioId?: string;
   currentPrice?: number;
@@ -655,6 +663,7 @@ export interface AlertItem {
   provenanceType: ProvenanceTag;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
 }
 
 export interface ResearchQueryItem {
@@ -664,6 +673,7 @@ export interface ResearchQueryItem {
   ticker?: string;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
   answerSummary: string;
   groundedFacts: { statement: string; tag: ProvenanceTag; sourceIndex: number }[];
   sources: {
@@ -1189,6 +1199,7 @@ export interface QuantStrategy {
   backtestId?: string;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
   isBuiltIn?: boolean;
 }
 
@@ -1537,6 +1548,7 @@ export interface EvidenceItem {
   conflictDetails?: string;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
 }
 
 export interface EvidenceFilter {
@@ -1560,7 +1572,11 @@ export interface IEvidenceRepository {
   getEvidenceBySecurity(securityId: string): EvidenceItem[];
   getEvidenceBySource(sourceType: EvidenceSourceType): EvidenceItem[];
   getEvidenceAvailableAsOf(asOfDate: string | Date, filter?: EvidenceFilter): EvidenceItem[];
+  /** @internal unscoped (system) read. HTTP callers must use the *ForOwner variants. */
   queryEvidence(filter: EvidenceFilter): EvidenceItem[];
+  /** Phase 38.2A: tenant-scoped reads; `ownerUserId` is mandatory (owner's private items + explicitly SHARED only). */
+  queryEvidenceForOwner(ownerUserId: string, filter: EvidenceFilter): EvidenceItem[];
+  getEvidenceAvailableAsOfForOwner(ownerUserId: string, asOfDate: string | Date, filter?: EvidenceFilter): EvidenceItem[];
   query?(filter: EvidenceFilter): EvidenceItem[];
   removeEvidence(evidenceId: string): boolean;
   getAll(): EvidenceItem[];
@@ -1578,6 +1594,8 @@ export interface EvidenceGatherOptions {
     metrics?: PortfolioMetrics;
   };
   filter?: EvidenceFilter;
+  /** Phase 38.2A: authenticated principal on whose behalf evidence is gathered (scopes private items + results). */
+  ownerUserId?: string;
 }
 
 // ==========================================
@@ -1883,6 +1901,8 @@ export interface PortfolioCalculationOptions {
 }
 
 export interface PortfolioAnalysisRequest {
+  /** Phase 38.2A: authenticated principal; scopes portfolio-derived evidence to this owner. */
+  ownerUserId?: string;
   query: string;
   portfolioId?: string;
   asOfDate?: string;
@@ -2023,6 +2043,7 @@ export interface CanonicalWatchlistItem {
   ticker?: string; // backwards compatibility alias
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
 }
 
 export interface AlertRule {
@@ -2044,6 +2065,7 @@ export interface AlertRule {
   metadata?: Record<string, unknown>;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
 }
 
 export interface AlertEvaluation {
@@ -2114,6 +2136,7 @@ export interface AlertEvent {
   filingDate?: string;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
 }
 
 export interface WatchlistAlertState {
@@ -2493,6 +2516,7 @@ export interface ResearchNotebook {
   provenance: PointInTimeProvenance;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
 }
 
 export interface ResearchSnapshot {
@@ -2516,6 +2540,7 @@ export interface ResearchSnapshot {
   };
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
 }
 
 export interface ResearchNotebookResponse {
@@ -2573,6 +2598,7 @@ export interface ResearchDocument {
   uploadedBy?: string;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
   pageCount?: number;
   characterCount?: number;
   rowCount?: number;
@@ -2610,6 +2636,7 @@ export interface DocumentUploadRequest {
   uploadedBy?: string;
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
 }
 
 export interface DocumentUploadResult {
@@ -2749,6 +2776,7 @@ export interface InvestmentDecisionAssessment {
   contradictingEvidenceIds: string[];
   ownerUserId?: string;
   userId?: string;
+  visibility?: 'PRIVATE' | 'SHARED';
   evidenceCoverage: {
     rating: 'HIGH' | 'MODERATE' | 'LIMITED' | 'INSUFFICIENT';
     totalEvidenceCount: number;
@@ -2808,6 +2836,8 @@ export interface InvestmentDecisionAssessment {
     operatingMarginTrend?: 'EXPANDING' | 'STABLE' | 'CONTRACTING' | 'UNKNOWN';
     netIncomeTrend?: 'GROWING' | 'FLAT' | 'DECLINING' | 'UNKNOWN';
     operatingCashFlowTrend?: 'POSITIVE' | 'NEUTRAL' | 'NEGATIVE' | 'UNKNOWN';
+    revenueGrowthPct?: number;
+    operatingMarginPct?: number;
     availablePeriodsCount: number;
     summary: string;
   };
@@ -2887,9 +2917,13 @@ export interface DecisionEvaluateRequest {
   asOfDate?: string;
   configuration?: Partial<DecisionFrameworkConfiguration>;
   forceRefresh?: boolean;
+  /** Phase 38.2A: authenticated principal. Scopes the cache, persisted lookup and ownership stamp of the assessment. */
+  ownerUserId?: string;
 }
 
 export interface DecisionCompareRequest {
+  /** Phase 38.2A: authenticated principal (owner scope). */
+  ownerUserId?: string;
   securityIdA: string;
   securityIdB: string;
   asOfDate?: string;
@@ -2900,11 +2934,31 @@ export interface DecisionCompareRequest {
 // PHASE 16: PERSISTENCE & AUDIT ARCHITECTURE
 // ==========================================
 
-export type PersistenceStatusCode = 'CONNECTED' | 'DEVELOPMENT_ADAPTER' | 'UNCONFIGURED' | 'ERROR';
+export type PersistenceStatusCode = 'CONNECTED' | 'DEVELOPMENT_ADAPTER' | 'UNCONFIGURED' | 'ERROR' | 'DEGRADED_FALLBACK';
 export type PersistenceProviderType = 'POSTGRES' | 'DISK_STORAGE' | 'IN_MEMORY';
+
+/**
+ * Phase 38.2B: which storage backend is actually serving requests and why.
+ *  POSTGRES                 PostgreSQL connected (authoritative)
+ *  DISK_EXPLICIT            operator chose disk with PERSISTENCE_MODE=disk (authoritative dev store)
+ *  DISK_UNCONFIGURED        no DATABASE_URL configured (development store)
+ *  DISK_DEGRADED_FALLBACK   PostgreSQL IS configured but unavailable; writes go to a NON-authoritative disk store
+ */
+export type StorageMode = 'POSTGRES' | 'DISK_EXPLICIT' | 'DISK_UNCONFIGURED' | 'DISK_DEGRADED_FALLBACK';
+
+export interface StorageHealth {
+  mode: StorageMode;
+  degraded: boolean;
+  /** true when this backend is the system of record for the configured deployment */
+  authoritative: boolean;
+  reason?: string;
+  warnings: string[];
+}
 
 export interface PersistenceStatusResponse {
   status: PersistenceStatusCode;
+  /** Phase 38.2B: truthful storage-mode reporting (added by PersistenceManager). */
+  storage?: StorageHealth;
   provider: PersistenceProviderType;
   environment: string;
   isPostgresConfigured: boolean;
@@ -3268,6 +3322,8 @@ export interface DecisionTimelineResponse {
 }
 
 export interface MultiPeerComparisonRequest {
+  /** Phase 38.2A: authenticated principal (owner scope). */
+  ownerUserId?: string;
   securityIds: string[];
   asOfDate?: string;
   configuration?: Partial<DecisionFrameworkConfiguration>;

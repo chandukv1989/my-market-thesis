@@ -28,7 +28,7 @@ import {
   EvidenceRelationshipType,
   EpistemicStatus
 } from '../../types';
-import { CANONICAL_SECURITIES } from '../../data/canonicalSecurities';
+import { CANONICAL_SECURITIES, resolveSecurity } from '../../data/canonicalSecurities';
 import {
   Database,
   FileCheck2,
@@ -71,8 +71,10 @@ export const EvidenceCollectionView: React.FC<EvidenceCollectionViewProps> = ({
   onSelectStock,
   onOpenEvidence
 }) => {
+  // The dropdown options are keyed by canonical id (e.g. 'us-aapl'); the app passes a plain ticker ('AAPL'),
+  // so resolve it, otherwise the <select> has no matching option and shows its first entry (NVDA).
   const [selectedSecurityId, setSelectedSecurityId] = useState<string>(
-    initialSecurityId || 'NVDA'
+    (initialSecurityId && resolveSecurity(initialSecurityId)?.id) || initialSecurityId || 'us-nvda'
   );
   const [asOfDate, setAsOfDate] = useState<string>(
     new Date().toISOString().split('T')[0]
@@ -335,8 +337,8 @@ export const EvidenceCollectionView: React.FC<EvidenceCollectionViewProps> = ({
             <select
               value={selectedSecurityId}
               onChange={e => {
+                // Stay on the ledger: onSelectStock navigates to Deep Dive and re-mounts this view.
                 setSelectedSecurityId(e.target.value);
-                if (onSelectStock) onSelectStock(e.target.value);
               }}
               className="bg-[#0c2238] border border-[#1c2b3c] text-xs rounded px-2.5 py-1 text-white font-mono focus:outline-none focus:border-emerald-500"
             >

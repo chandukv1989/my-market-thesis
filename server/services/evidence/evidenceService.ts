@@ -20,18 +20,67 @@ import {
   EvidenceSourceType
 } from '../../../src/types';
 import { resolveSecurity } from '../../../src/data/canonicalSecurities';
-import { EvidenceRepository } from './evidenceRepository';
+import { EvidenceRepository, evidenceRepository } from './evidenceRepository';
 import { secEvidenceAdapter } from './adapters/secEvidenceAdapter';
 import { marketEvidenceAdapter } from './adapters/marketEvidenceAdapter';
 import { portfolioEvidenceAdapter } from './adapters/portfolioEvidenceAdapter';
 import { metadataEvidenceAdapter } from './adapters/metadataEvidenceAdapter';
 import { finmagineEvidenceAdapter } from './adapters/finmagineEvidenceAdapter';
+import { createHash } from 'crypto';
+import { canRead, resolveOwnerId } from '../../auth/accessPolicy';
+
+/** Source types produced by system providers from public data and therefore classified SHARED at gather time. */
+export const SHARED_PROVIDER_SOURCE_TYPES: EvidenceSourceType[] = [
+  'SEC_EDGAR',
+  'OFFICIAL_FILINGS',
+  'MARKET_DATA',
+  'CANONICAL_METADATA',
+  'FINMAGINE'
+];
+
+/**
+ * Phase 38.2A: portfolio-derived evidence reflects one tenant's holdings. Stamp it PRIVATE to `ownerUserId`
+ * with an owner-scoped evidence id so it can neither be read by, nor overwrite items of, other tenants.
+ */
+export function scopePortfolioEvidenceToOwner(items: EvidenceItem[], ownerUserId?: string): EvidenceItem[] {
+  if (!ownerUserId) return items;
+  const suffix = createHash('sha256').update(ownerUserId).digest('hex').slice(0, 8);
+  for (const item of items) {
+    if (resolveOwnerId(item) === ownerUserId && item.evidenceId.endsWith(`-${suffix}`)) continue;
+    item.evidenceId = `${item.evidenceId}-${suffix}`;
+    item.ownerUserId = ownerUserId;
+    item.userId = ownerUserId;
+    item.visibility = 'PRIVATE';
+  }
+  return items;
+}
+
+/**
+ * Phase 38.2E: explicit visibility decision for freshly fetched provider evidence (never inferred from a missing owner).
+ *  - carries an owner                                   -> PRIVATE
+ *  - source type on the approved provider allow-list
+ *    AND a named provider AND a parseable publication/retrieval date (verified provenance) -> SHARED
+ *  - anything else (unknown source type, blank provider, undated, ambiguous)  -> PRIVATE (restricted: ownerless+PRIVATE)
+ * Simulated/unavailable provider items keep their epistemic labels untouched; they are not private data, so they stay
+ * on the same sharing path as real provider items (their label is never changed here).
+ */
+export function classifyProviderEvidence(item: EvidenceItem): 'SHARED' | 'PRIVATE' {
+  if (resolveOwnerId(item)) return 'PRIVATE';
+  if (item.visibility === 'PRIVATE') return 'PRIVATE';
+  const hasProvider = typeof item.provider === 'string' && item.provider.trim().length > 0;
+  const hasDate = [item.publishedAt, item.retrievedAt].some(d => !!d && !Number.isNaN(new Date(d as string).getTime()));
+  if (SHARED_PROVIDER_SOURCE_TYPES.includes(item.sourceType) && hasProvider && hasDate) return 'SHARED';
+  return 'PRIVATE';
+}
 
 export class EvidenceService {
   private repository: EvidenceRepository;
 
   constructor(repository?: EvidenceRepository) {
-    this.repository = repository || new EvidenceRepository();
+    // Phase 38.2E: ONE canonical in-memory repository. The decision service and every other consumer import the same
+    // `evidenceRepository` singleton, so what gatherEvidence stores is what decisions read (previously this default was a
+    // second, independent instance).
+    this.repository = repository || evidenceRepository;
   }
 
   /**
@@ -65,6 +114,7 @@ export class EvidenceService {
     }
 
     const gatheredItems: EvidenceItem[] = [];
+    const ownerUserId = options.ownerUserId;
 
     // 2. Gather Canonical Metadata Evidence
     for (const sec of targetSecurities) {
@@ -95,6 +145,9 @@ export class EvidenceService {
         targetSecurities,
         asOfDate
       );
+      // Phase 38.2A: portfolio-derived evidence reflects one tenant's holdings. It is stamped PRIVATE to the
+      // requesting owner with an owner-scoped id so it can neither be read by, nor overwrite items of, other tenants.
+      scopePortfolioEvidenceToOwner(portItems, ownerUserId);
       gatheredItems.push(...portItems);
     }
 
@@ -109,18 +162,26 @@ export class EvidenceService {
       }
     }
 
+    // Phase 38.2A: explicit classification. Items fetched from system providers (canonical metadata, market data,
+    // SEC EDGAR, Finmagine) are public reference data and are classified SHARED here, by provenance. Items that
+    // carry an owner stay PRIVATE. Nothing is ever classified public merely because an owner is missing.
+    for (const item of gatheredItems) {
+      item.visibility = classifyProviderEvidence(item);
+    }
+
     // 7. Register into EvidenceRepository (deduplicates and flags conflicts)
     this.repository.addEvidenceBatch(gatheredItems);
 
-    // 7. Point-in-time and filtered return
+    // 7. Point-in-time and filtered return (always restricted to what the caller may read)
+    const readable = (items: EvidenceItem[]) => items.filter(i => canRead(i, ownerUserId));
     if (asOfDate) {
-      return this.repository.getEvidenceAvailableAsOf(asOfDate, filter);
+      return readable(this.repository.getEvidenceAvailableAsOf(asOfDate, filter));
     } else if (filter) {
-      return this.repository.queryEvidence(filter);
+      return readable(this.repository.queryEvidence(filter));
     }
 
     // Default: return all newly gathered items (sanitized from repository)
-    return gatheredItems.map(item => this.repository.getEvidence(item.evidenceId) || item);
+    return readable(gatheredItems.map(item => this.repository.getEvidence(item.evidenceId) || item));
   }
 
   /**

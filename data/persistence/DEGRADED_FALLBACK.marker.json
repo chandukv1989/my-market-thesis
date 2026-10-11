@@ -1,0 +1,5 @@
+{
+  "since": "2026-10-11T14:18:25.078Z",
+  "reason": "PostgreSQL configured but unavailable: Failed to connect to PostgreSQL database.",
+  "note": "Writes in this directory were made while PostgreSQL was configured but unavailable. They are NOT authoritative and are not reconciled automatically."
+}

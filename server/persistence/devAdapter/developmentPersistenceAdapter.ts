@@ -11,6 +11,16 @@
  * - Point-in-time filtering strictly respected.
  */
 
+import { canRead, requireTenantScope } from '../../auth/accessPolicy';
+import { isAvailableAsOf } from '../pit';
+
+/** Phase 38.2B: an upsert may never change (or take over) the owner of an existing record. */
+function assertSameOwner(existing: any, incoming: any, label: string): void {
+  if (!existing) return;
+  const a = existing.ownerUserId || existing.userId || existing.tenantId || '';
+  const b = incoming.ownerUserId || incoming.userId || incoming.tenantId || '';
+  if (a !== b) throw new Error(`${label} belongs to a different owner; overwrite refused.`);
+}
 import fs from 'fs';
 import path from 'path';
 import {
@@ -349,6 +359,10 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
   public getEvidenceRelationshipRepository(): IEvidenceRelationshipRepository { return this.evidenceRelationshipRepo; }
   public getEvidenceAuditRepository(): IEvidenceAuditRepository { return this.evidenceAuditRepo; }
 
+  public getStorageDir(): string {
+    return this.storageDir;
+  }
+
   public async getStatus(): Promise<PersistenceStatusResponse> {
     return {
       status: 'DEVELOPMENT_ADAPTER',
@@ -421,6 +435,7 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
     return {
       get: async (id: string) => this.state.documents[id] || null,
       getByHash: async (hash: string) => {
+        // NOTE: returns the first match across owners; callers needing tenant-safe dedup use save()'s per-owner check.
         return Object.values(this.state.documents).find(d => d.contentHash === hash) || null;
       },
       getAll: async (filter?: { securityId?: string; documentType?: string }) => {
@@ -434,7 +449,9 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
         return docs;
       },
       save: async (doc: ResearchDocument) => {
-        const existing = Object.values(this.state.documents).find(d => d.contentHash === doc.contentHash);
+        // Phase 38.2B: duplicate detection is per owner (identical content from another tenant is NOT a duplicate)
+        const ownerKey = (d: any) => d.ownerUserId || d.userId || '';
+        const existing = Object.values(this.state.documents).find(d => d.contentHash === doc.contentHash && ownerKey(d) === ownerKey(doc));
         if (existing) {
           return { saved: false, isDuplicate: true, document: existing };
         }
@@ -453,6 +470,25 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
         }
         this.flushToDisk();
         return true;
+      },
+      deleteForOwner: async (documentId: string, ownerUserId: string) => {
+        const scope = requireTenantScope(ownerUserId);
+        const doc: any = this.state.documents[documentId];
+        if (!doc || (doc.ownerUserId || doc.userId) !== scope) return false;
+        delete this.state.documents[documentId];
+        this.flushToDisk();
+        return true;
+      },
+      getAllForOwner: async (ownerUserId: string, filter?: { securityId?: string; documentType?: string }) => {
+        const scope = requireTenantScope(ownerUserId);
+        let docs = Object.values(this.state.documents).filter(d => canRead(d as any, scope));
+        if (filter?.documentType) {
+          docs = docs.filter(d => d.documentType === filter.documentType);
+        }
+        if (filter?.securityId) {
+          docs = docs.filter(d => d.securityId === filter.securityId || (d as any).securityAssociations?.some((x: any) => x.securityId === filter.securityId));
+        }
+        return docs;
       },
       count: async () => Object.keys(this.state.documents).length
     };
@@ -485,18 +521,28 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
           items = items.filter(e => statuses.includes(e.epistemicStatus));
         }
         if (filter.asOfDate) {
-          const asOfStr = typeof filter.asOfDate === 'string' ? filter.asOfDate : (filter.asOfDate as Date).toISOString();
-          const target = asOfStr.includes('T')
-            ? new Date(asOfStr).getTime()
-            : new Date(`${asOfStr}T23:59:59.999Z`).getTime();
-          items = items.filter(e => !e.publishedAt || new Date(e.publishedAt).getTime() <= target);
+          // Shared PIT rule: date-only = end of day inclusive; undated evidence is never "available as of" a date.
+          items = items.filter(e => isAvailableAsOf(e.publishedAt, filter.asOfDate));
         }
         return items;
+      },
+      deleteForOwner: async (evidenceId: string, ownerUserId: string) => {
+        const scope = requireTenantScope(ownerUserId);
+        const ev: any = this.state.evidence[evidenceId];
+        if (!ev || (ev.ownerUserId || ev.userId) !== scope) return false;
+        delete this.state.evidence[evidenceId];
+        this.flushToDisk();
+        return true;
+      },
+      queryEvidenceForOwner: async (ownerUserId: string, filter: EvidenceFilter) => {
+        const scope = requireTenantScope(ownerUserId);
+        const items = await this.evidenceRepo.queryEvidence(filter);
+        return items.filter(e => canRead(e as any, scope));
       },
       getHistoricalEvidence: async (id: string, asOfDate?: string) => {
         const item = this.state.evidence[id];
         if (!item) return null;
-        if (asOfDate && item.publishedAt && new Date(item.publishedAt) > new Date(asOfDate)) {
+        if (asOfDate && !isAvailableAsOf(item.publishedAt, asOfDate)) {
           return null;
         }
         return item;
@@ -518,11 +564,16 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
         return found || null;
       },
       save: async (notebook: ResearchNotebook) => {
+        assertSameOwner(this.state.notebooks[notebook.notebookId], notebook, `Notebook "${notebook.notebookId}"`);
         this.state.notebooks[notebook.notebookId] = { ...notebook };
         this.flushToDisk();
         return this.state.notebooks[notebook.notebookId];
       },
       getAll: async () => Object.values(this.state.notebooks),
+      getAllForOwner: async (ownerUserId: string) => {
+        const scope = requireTenantScope(ownerUserId);
+        return Object.values(this.state.notebooks).filter(n => canRead(n as any, scope));
+      },
       count: async () => Object.keys(this.state.notebooks).length
     };
   }
@@ -535,6 +586,10 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
       },
       getBySecurityId: async (securityId: string) => {
         return Object.values(this.state.snapshots).filter(s => s.securityId === securityId);
+      },
+      getBySecurityIdForOwner: async (securityId: string, ownerUserId: string) => {
+        const scope = requireTenantScope(ownerUserId);
+        return Object.values(this.state.snapshots).filter(s => s.securityId === securityId && canRead(s as any, scope));
       },
       getLatest: async (securityId: string, asOfDate?: string) => {
         let snaps = Object.values(this.state.snapshots).filter(s => s.securityId === securityId);
@@ -574,6 +629,12 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
         decs.sort((a, b) => (b.asOfDate || '').localeCompare(a.asOfDate || '') || (b.generatedAt || '').localeCompare(a.generatedAt || ''));
         return decs;
       },
+      getHistoryForOwner: async (securityId: string, ownerUserId: string) => {
+        const scope = requireTenantScope(ownerUserId);
+        const decs = Object.values(this.state.decisions).filter(d => d.securityId === securityId && canRead(d as any, scope));
+        decs.sort((a, b) => (b.asOfDate || '').localeCompare(a.asOfDate || '') || (b.generatedAt || '').localeCompare(a.generatedAt || ''));
+        return decs;
+      },
       save: async (decision: InvestmentDecisionAssessment) => {
         // IMMUTABLE: never overwrite
         if (this.state.decisions[decision.decisionId]) {
@@ -592,8 +653,13 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
     return {
       get: async (id: string) => this.state.strategies[id] || null,
       getAll: async () => Object.values(this.state.strategies),
+      getAllForOwner: async (ownerUserId: string) => {
+        const scope = requireTenantScope(ownerUserId);
+        return Object.values(this.state.strategies).filter(x => canRead(x as any, scope));
+      },
       save: async (strategy: Strategy) => {
         const id = strategy.id || (strategy as any).strategyId;
+        assertSameOwner(this.state.strategies[id], strategy, `Strategy "${id}"`);
         this.state.strategies[id] = { ...strategy };
         this.flushToDisk();
         return this.state.strategies[id];
@@ -609,6 +675,10 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
         return Object.values(this.state.backtests).filter(b => b.strategyId === strategyId || (b as any).configuration?.strategyId === strategyId);
       },
       getAll: async () => Object.values(this.state.backtests),
+      getAllForOwner: async (ownerUserId: string) => {
+        const scope = requireTenantScope(ownerUserId);
+        return Object.values(this.state.backtests).filter(b => canRead(b as any, scope));
+      },
       save: async (backtest: BacktestResult) => {
         // IMMUTABLE: never rerun or overwrite
         if (this.state.backtests[backtest.backtestId]) {
@@ -648,7 +718,12 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
     return {
       get: async (id: string) => this.state.alerts[id] || null,
       getAll: async () => Object.values(this.state.alerts),
+      getAllForOwner: async (ownerUserId: string) => {
+        const scope = requireTenantScope(ownerUserId);
+        return Object.values(this.state.alerts).filter(x => canRead(x as any, scope));
+      },
       save: async (alert: AlertItem) => {
+        assertSameOwner(this.state.alerts[alert.id], alert, `Alert "${alert.id}"`);
         this.state.alerts[alert.id] = { ...alert };
         this.flushToDisk();
         return this.state.alerts[alert.id];
@@ -694,6 +769,10 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
     return {
       get: async (id: string) => this.state.queries[id] || null,
       getAll: async () => Object.values(this.state.queries),
+      getAllForOwner: async (ownerUserId: string) => {
+        const scope = requireTenantScope(ownerUserId);
+        return Object.values(this.state.queries).filter(x => canRead(x as any, scope));
+      },
       save: async (query: ResearchQueryItem) => {
         const id = (query as any).queryId || query.id;
         this.state.queries[id] = { ...query };
@@ -897,6 +976,7 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
       },
       save: async (monitor: InvestmentMonitor) => {
         if (!this.state.monitors) this.state.monitors = {};
+        assertSameOwner(this.state.monitors[monitor.monitorId], monitor, `Monitor "${monitor.monitorId}"`);
         this.state.monitors[monitor.monitorId] = { ...monitor };
         this.flushToDisk();
         return { ...this.state.monitors[monitor.monitorId] };
@@ -998,6 +1078,7 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
       },
       save: async (policy: MonitoringPolicy) => {
         if (!this.state.monitoringPolicies) this.state.monitoringPolicies = {};
+        assertSameOwner(this.state.monitoringPolicies[policy.policyId], policy, `Policy "${policy.policyId}"`);
         this.state.monitoringPolicies[policy.policyId] = { ...policy };
         this.flushToDisk();
         return { ...this.state.monitoringPolicies[policy.policyId] };
@@ -1088,6 +1169,7 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
       },
       save: async (alert: AlertInstance) => {
         if (!this.state.orchestratedAlerts) this.state.orchestratedAlerts = {};
+        assertSameOwner(this.state.orchestratedAlerts[alert.alertId], alert, `Orchestrated alert "${alert.alertId}"`);
         this.state.orchestratedAlerts[alert.alertId] = { ...alert };
         this.flushToDisk();
         return { ...this.state.orchestratedAlerts[alert.alertId] };
@@ -1331,6 +1413,7 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
         if (!this.state.researchMemories[entry.id]) {
           throw new Error(`Research memory with ID "${entry.id}" not found.`);
         }
+        assertSameOwner(this.state.researchMemories[entry.id], entry, `Research memory "${entry.id}"`);
         this.state.researchMemories[entry.id] = JSON.parse(JSON.stringify(entry));
         this.flushToDisk();
         return JSON.parse(JSON.stringify(this.state.researchMemories[entry.id]));
@@ -1394,6 +1477,7 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
       },
       save: async (question: ResearchQuestionEntry) => {
         if (!this.state.researchQuestions) this.state.researchQuestions = {};
+        assertSameOwner(this.state.researchQuestions[question.id], question, `Research question "${question.id}"`);
         this.state.researchQuestions[question.id] = JSON.parse(JSON.stringify(question));
         this.flushToDisk();
         return JSON.parse(JSON.stringify(this.state.researchQuestions[question.id]));
@@ -1403,6 +1487,7 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
         if (!this.state.researchQuestions[question.id]) {
           throw new Error(`Research question with ID "${question.id}" not found.`);
         }
+        assertSameOwner(this.state.researchQuestions[question.id], question, `Research question "${question.id}"`);
         this.state.researchQuestions[question.id] = JSON.parse(JSON.stringify(question));
         this.flushToDisk();
         return JSON.parse(JSON.stringify(this.state.researchQuestions[question.id]));
@@ -1484,6 +1569,7 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
         if (!this.state.researchGaps[gap.gapId]) {
           throw new Error(`Research gap with ID "${gap.gapId}" not found.`);
         }
+        assertSameOwner(this.state.researchGaps[gap.gapId], gap, `Research gap "${gap.gapId}"`);
         this.state.researchGaps[gap.gapId] = JSON.parse(JSON.stringify(gap));
         this.flushToDisk();
         return JSON.parse(JSON.stringify(this.state.researchGaps[gap.gapId]));
@@ -1560,6 +1646,7 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
         if (!this.state.investigationPlans[plan.planId]) {
           throw new Error(`Investigation plan with ID "${plan.planId}" not found.`);
         }
+        assertSameOwner(this.state.investigationPlans[plan.planId], plan, `Investigation plan "${plan.planId}"`);
         this.state.investigationPlans[plan.planId] = JSON.parse(JSON.stringify(plan));
         this.flushToDisk();
         return JSON.parse(JSON.stringify(this.state.investigationPlans[plan.planId]));
@@ -1737,12 +1824,19 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
       },
       save: async (record: EvidenceCollectionRecord) => {
         if (!this.state.evidenceCollections) this.state.evidenceCollections = {};
+        if (this.state.evidenceCollections[record.collectionId]) {
+          throw new Error(`Evidence collection record with ID "${record.collectionId}" already exists. Overwrite prohibited.`);
+        }
         this.state.evidenceCollections[record.collectionId] = JSON.parse(JSON.stringify(record));
         this.flushToDisk();
         return JSON.parse(JSON.stringify(this.state.evidenceCollections[record.collectionId]));
       },
       update: async (record: EvidenceCollectionRecord) => {
         if (!this.state.evidenceCollections) this.state.evidenceCollections = {};
+        if (!this.state.evidenceCollections[record.collectionId]) {
+          throw new Error(`Evidence collection record with ID "${record.collectionId}" not found.`);
+        }
+        assertSameOwner(this.state.evidenceCollections[record.collectionId], record, `Evidence collection "${record.collectionId}"`);
         this.state.evidenceCollections[record.collectionId] = JSON.parse(JSON.stringify(record));
         this.flushToDisk();
         return JSON.parse(JSON.stringify(this.state.evidenceCollections[record.collectionId]));
@@ -1801,6 +1895,7 @@ export class DevelopmentPersistenceAdapter implements IPersistenceAdapter {
       },
       save: async (rel: EvidenceResearchRelationship) => {
         if (!this.state.evidenceRelationships) this.state.evidenceRelationships = {};
+        assertSameOwner(this.state.evidenceRelationships[rel.relationshipId], rel, `Evidence relationship "${rel.relationshipId}"`);
         this.state.evidenceRelationships[rel.relationshipId] = JSON.parse(JSON.stringify(rel));
         this.flushToDisk();
         return JSON.parse(JSON.stringify(this.state.evidenceRelationships[rel.relationshipId]));

@@ -15,7 +15,9 @@ import {
   EvidenceChunk,
   DocumentProcessingStatus
 } from '../../../src/types';
+import { createHash } from 'crypto';
 import { documentRegistry } from './documentRegistry';
+import { persistenceManager } from '../../persistence/persistenceManager';
 import { parseDocument, computeContentHash } from './documentParser';
 import { documentEvidenceAdapter } from './documentEvidenceAdapter';
 import { evidenceService } from '../evidence/evidenceService';
@@ -86,7 +88,7 @@ export class DocumentIngestionService {
     const contentHash = computeContentHash(buffer);
 
     // 3. Duplicate detection check
-    const existingDoc = documentRegistry.getDocumentByHash(contentHash);
+    const existingDoc = documentRegistry.getDocumentByHash(contentHash, resolvedOwner);
     if (existingDoc) {
       return {
         document: existingDoc,
@@ -117,7 +119,11 @@ export class DocumentIngestionService {
     });
 
     const now = new Date().toISOString();
-    const docId = `doc-${contentHash.slice(0, 12)}`;
+    // Phase 38.2A: owner-scoped identity so identical content uploaded by different tenants never collides.
+    // Ownerless (system/legacy) ingestion keeps the original `doc-<hash12>` form.
+    const docId = resolvedOwner
+      ? `doc-${createHash('sha256').update(`${resolvedOwner}:${contentHash}`).digest('hex').slice(0, 12)}`
+      : `doc-${contentHash.slice(0, 12)}`;
 
     // Build initial document record
     const document: ResearchDocument = {
@@ -134,6 +140,7 @@ export class DocumentIngestionService {
       uploadedBy,
       ownerUserId: resolvedOwner,
       userId: resolvedOwner,
+      visibility: resolvedOwner ? 'PRIVATE' : (request.visibility === 'SHARED' ? 'SHARED' : undefined),
       pageCount: parseResult.pageCount,
       characterCount: parseResult.characterCount,
       rowCount: parseResult.rowCount,
@@ -166,7 +173,11 @@ export class DocumentIngestionService {
       for (const item of evidenceItems) {
         item.ownerUserId = resolvedOwner;
         (item as any).userId = resolvedOwner;
+        item.visibility = 'PRIVATE';
       }
+    } else if (request.visibility === 'SHARED') {
+      // Explicit, system-level classification (never reachable from the HTTP API, which always sets the owner).
+      for (const item of evidenceItems) item.visibility = 'SHARED';
     }
 
     // 7. Chunk each EvidenceItem using the existing chunking engine
@@ -247,7 +258,33 @@ export class DocumentIngestionService {
   }
 
   /**
-   * Removes document from registry and purges its evidence from EvidenceRepository.
+   * Phase 38.2E: DURABLE, owner-only delete. Removes the document and the PRIVATE evidence derived from it from the
+   * in-memory registry/repository AND from persistent storage, so nothing resurrects after a restart (hydration reads
+   * the persistent stores). Only the document's owner can delete; SHARED, ownerless/legacy and other tenants' records
+   * are never touched (returns false). SHARED provider evidence is never purged because it is not owned.
+   */
+  public async deleteDocumentForOwner(documentId: string, ownerUserId: string): Promise<boolean> {
+    const persisted = persistenceManager.getDocumentRepository();
+    const doc: any = documentRegistry.getDocument(documentId) || (await persisted.get(documentId));
+    if (!doc) return false;
+    const owner = doc.ownerUserId || doc.userId;
+    if (!ownerUserId || !owner || owner !== ownerUserId) return false;
+
+    const memoryRepo = evidenceService.getRepository();
+    const persistedEvidence = persistenceManager.getEvidenceRepository();
+    for (const evId of (doc.evidenceIds || []) as string[]) {
+      const inMem: any = memoryRepo.getEvidence(evId);
+      if (inMem && (inMem.ownerUserId || inMem.userId) === ownerUserId) memoryRepo.removeEvidence(evId);
+      await persistedEvidence.deleteForOwner(evId, ownerUserId);
+    }
+    documentRegistry.deleteDocument(documentId);
+    await persisted.deleteForOwner(documentId, ownerUserId);
+    return true;
+  }
+
+  /**
+   * @internal In-memory only (does NOT delete from persistent storage and performs no authorization). Kept for
+   * system/test callers; HTTP routes must use deleteDocumentForOwner.
    */
   public deleteDocument(documentId: string): boolean {
     const doc = documentRegistry.getDocument(documentId);

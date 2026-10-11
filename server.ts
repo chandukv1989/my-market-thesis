@@ -3,9 +3,9 @@
  * Integrates Vite middleware in development and serves static assets in production.
  */
 
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import { financialDataService } from './server/services/financialDataService';
 import { classifyAndResolve, extractSecuritiesFromText } from './src/services/searchIntelligence';
 import { resolveSecurity } from './src/data/canonicalSecurities';
@@ -41,6 +41,8 @@ import { SecurityIdentifier, ResearchAnalysisType, ResearchRequest, EvidenceSour
 import { authService, AuthenticationError } from './server/auth/authService';
 import { resolveUser, requireAuth, setSessionCookie, clearSessionCookie } from './server/auth/authMiddleware';
 import { authorizationService, AuthorizationError } from './server/auth/authorizationService';
+import { apiAuthGate, requireUserId, isAdminUser, AuthenticationRequiredError } from './server/auth/routePolicy';
+import { TenantScopeError } from './server/auth/accessPolicy';
 import { requestCorrelation } from './server/middleware/requestCorrelation';
 import { structuredLogger } from './server/logging/structuredLogger';
 import { authRateLimiter, researchRateLimiter, backtestRateLimiter, documentUploadRateLimiter } from './server/middleware/rateLimiter';
@@ -49,9 +51,23 @@ import { finmagineProvider } from './server/providers/finmagineProvider';
 import { environmentConfigService } from './server/config/environmentConfig';
 import { pilotReadinessService } from './server/services/pilot/pilotReadinessService';
 
-async function startServer() {
+/**
+ * Builds the fully-wired Express application WITHOUT binding a port or attaching Vite/static serving.
+ * Exported so route/authorization behavior can be exercised deterministically (Phase 38.2A tests).
+ */
+export async function createApp(options: { initializePersistence?: boolean; persistence?: Pick<typeof persistenceManager, 'getStorageHealth'> } = {}) {
+  const storageSource = options.persistence ?? persistenceManager;
   const app = express();
-  const PORT = 3000;
+
+  /** Maps authorization-flavoured failures onto the right status instead of a blanket 400/500. */
+  const statusForError = (err: unknown, fallback: number): number => {
+    if (err instanceof AuthenticationRequiredError) return 401;
+    if (err instanceof AuthorizationError) return err.statusCode;
+    if (err instanceof TenantScopeError) return 401;
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/UNAUTHORIZED|AuthorizationError|Access denied|Forbidden|not authorized/i.test(msg)) return 403;
+    return fallback;
+  };
 
   // Phase 18: Security Headers & Correlation
   app.use(requestCorrelation);
@@ -142,28 +158,43 @@ async function startServer() {
   // PHASE 16: PERSISTENCE INITIALIZATION & HYDRATION
   // ==========================================
   try {
-    await persistenceManager.initialize();
-    await Promise.all([
-      documentRegistry.hydrateFromPersistence(),
-      (evidenceService.getRepository() as any).hydrateFromPersistence?.(),
-      researchNotebookService.hydrateFromPersistence(),
-      backtestService.hydrateFromPersistence(),
-      investmentEventEngine.ensureInitialized(),
-      investmentMonitorEngine.initialize()
-    ]);
+    if (options.initializePersistence !== false) {
+      await persistenceManager.initialize();
+      await Promise.all([
+        documentRegistry.hydrateFromPersistence(),
+        (evidenceService.getRepository() as any).hydrateFromPersistence?.(),
+        researchNotebookService.hydrateFromPersistence(),
+        backtestService.hydrateFromPersistence(),
+        investmentEventEngine.ensureInitialized(),
+        investmentMonitorEngine.initialize()
+      ]);
+    }
   } catch (err) {
     console.error('[Server] Persistence initialization error:', err);
   }
 
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+  // Phase 38.2A: identity resolution, rate limiting and the auth gate run BEFORE body parsing so anonymous
+  // callers are rejected (401) without their (up to 50 MB) payload ever being parsed.
   app.use(resolveUser);
 
   // Phase 18: Rate Limiting on sensitive and resource-intensive endpoints
-  app.use('/api/auth', authRateLimiter.middleware());
+  // Only credential-submitting endpoints count toward the limit; session checks (GET /me) and logout must not
+  // exhaust a user's login attempts.
+  app.use(['/api/auth/login', '/api/auth/register'], authRateLimiter.middleware());
   app.use('/api/research', researchRateLimiter.middleware());
   app.use('/api/backtests', backtestRateLimiter.middleware());
   app.use('/api/documents/upload', documentUploadRateLimiter.middleware());
+
+  // ==========================================
+  // PHASE 38.2A: DENY-BY-DEFAULT API AUTHENTICATION GATE
+  // Every /api route requires an authenticated server-side session except the enumerated
+  // PUBLIC_API_ROUTES (auth bootstrap + liveness). Mounted before all handlers so it cannot be bypassed
+  // by a handler (or an error inside one) and so unknown /api paths also answer 401.
+  // ==========================================
+  app.use('/api', apiAuthGate);
+
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   // ==========================================
   // PHASE 17: AUTHENTICATION & IDENTITY ROUTES
@@ -260,9 +291,12 @@ async function startServer() {
 
   // Health check endpoint
   app.get('/api/health', (_req, res) => {
+    // Phase 38.2B: truthful storage reporting without internals (mode + degraded flag only).
+    const storage = storageSource.getStorageHealth();
     res.json({
-      status: 'ok',
+      status: storage.degraded ? 'degraded' : 'ok',
       engine: 'Investment Intelligence Financial Data Service V1.0',
+      storage: { mode: storage.mode, degraded: storage.degraded, authoritative: storage.authoritative },
       timestamp: new Date().toISOString()
     });
   });
@@ -480,7 +514,13 @@ async function startServer() {
   });
 
   // Invalidate / clear cache
-  app.post('/api/sec/cache/clear', (_req, res) => {
+  app.post('/api/sec/cache/clear', (req, res) => {
+    // Phase 38.2A: destructive global maintenance (clears the shared evidence repository for ALL tenants).
+    // Restricted to operators listed in ADMIN_USER_IDS; fail-closed when unset.
+    if (!isAdminUser(req.user?.userId)) {
+      res.status(403).json({ error: 'Forbidden', code: 'ADMIN_REQUIRED', message: 'This maintenance endpoint requires an administrator.' });
+      return;
+    }
     financialDataService.clearCache();
     geminiResearchEngine.clearCache();
     evidenceService.getRepository().clear();
@@ -506,8 +546,9 @@ async function startServer() {
       if (Array.isArray(securityIds)) secList.push(...securityIds);
 
       // Pre-gather evidence into repository if target securities specified
+      const userId = requireUserId(req);
       if (secList.length > 0) {
-        await evidenceService.gatherEvidence({ securityIds: secList, asOfDate });
+        await evidenceService.gatherEvidence({ securityIds: secList, asOfDate, ownerUserId: userId });
       }
 
       const retrievalResult = await retrievalEngine.retrieve({
@@ -519,7 +560,7 @@ async function startServer() {
         epistemicStatus,
         asOfDate,
         limit,
-        userId: req.user?.userId
+        userId
       });
 
       res.json(retrievalResult);
@@ -531,6 +572,7 @@ async function startServer() {
 
   app.get('/api/evidence', async (req, res) => {
     try {
+      const userId = requireUserId(req);
       const securityId = req.query.securityId as string | undefined;
       const sourceType = req.query.sourceType as EvidenceSourceType | undefined;
       const provider = req.query.provider as string | undefined;
@@ -540,7 +582,7 @@ async function startServer() {
 
       // If a specific security is queried and not yet in repository, gather it
       if (securityId) {
-        await evidenceService.gatherEvidence({ securityIds: [securityId], asOfDate });
+        await evidenceService.gatherEvidence({ securityIds: [securityId], asOfDate, ownerUserId: userId });
       }
 
       const repo = evidenceService.getRepository();
@@ -553,16 +595,10 @@ async function startServer() {
         limit
       };
 
-      const rawEvidence = asOfDate
-        ? repo.getEvidenceAvailableAsOf(asOfDate, filter)
-        : repo.queryEvidence(filter);
-
-      // Scope to public or caller-owned items
-      const evidence = rawEvidence.filter(item => {
-        const itemOwner = item.ownerUserId || (item as any).userId;
-        if (!itemOwner) return true; // public
-        return req.user?.userId && itemOwner === req.user.userId;
-      });
+      // Phase 38.2A: tenant scope is applied by the repository itself (owner's private items + explicitly SHARED only).
+      const evidence = asOfDate
+        ? repo.getEvidenceAvailableAsOfForOwner(userId, asOfDate, filter)
+        : repo.queryEvidenceForOwner(userId, filter);
 
       res.json({
         evidence,
@@ -572,7 +608,7 @@ async function startServer() {
       });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
@@ -614,9 +650,11 @@ async function startServer() {
         analysisType || classifyAnalysisType(query, resolvedSecurities);
 
       // 3. Ensure evidence repository is populated with factual multi-provider evidence
+      const userId = requireUserId(req);
       await evidenceService.gatherEvidence({
         securities: resolvedSecurities,
-        portfolioContext
+        portfolioContext,
+        ownerUserId: userId
       });
 
       // 4. Retrieve bounded, diverse evidence using Semantic Retrieval Engine (Phase 8B)
@@ -624,7 +662,7 @@ async function startServer() {
       const retrievalResult = await retrievalEngine.retrieve({
         query: query.trim(),
         securityIds: targetSecIds.length > 0 ? targetSecIds : undefined,
-        userId: req.user?.userId
+        userId
       });
 
       // Map retrievalBundle to ResearchEvidenceItem
@@ -691,45 +729,40 @@ async function startServer() {
   // INVESTMENT RESEARCH NOTEBOOK API (PHASE 13)
   // ==========================================
 
-  // List all active research notebooks
+  // List the caller's research notebooks
   app.get('/api/research/notebooks', (req, res) => {
     try {
-      let list = researchNotebookService.listNotebooks();
-      if (req.user?.userId) {
-        list = list.filter(n => !n.ownerUserId || n.ownerUserId === req.user?.userId);
-      } else {
-        list = list.filter(n => !n.ownerUserId);
-      }
+      const list = researchNotebookService.listNotebooksForOwner(requireUserId(req));
       res.json({ notebooks: list, count: list.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // Get or initialize research notebook for a security
+  // Get or initialize the caller's research notebook for a security
   app.get('/api/research/notebook/:securityId', async (req, res) => {
     try {
       const { securityId } = req.params;
       const asOfDate = req.query.asOfDate as string | undefined;
-      const notebook = await researchNotebookService.getOrCreateNotebook(securityId, asOfDate);
+      const notebook = await researchNotebookService.getOrCreateNotebook(securityId, asOfDate, requireUserId(req));
       res.json(notebook);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // Get source registry items for a security
+  // Get source registry items for a security (shared provider sources + the caller's own private sources)
   app.get('/api/research/notebook/:securityId/sources', async (req, res) => {
     try {
       const { securityId } = req.params;
       const asOfDate = req.query.asOfDate as string | undefined;
-      const sources = await researchNotebookService.getNotebookSources(securityId, asOfDate);
+      const sources = await researchNotebookService.getNotebookSources(securityId, asOfDate, requireUserId(req));
       res.json({ sources, count: sources.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
@@ -738,15 +771,15 @@ async function startServer() {
     try {
       const { securityId } = req.params;
       const asOfDate = req.query.asOfDate as string | undefined;
-      const coverage = await researchNotebookService.getCoverage(securityId, asOfDate);
+      const coverage = await researchNotebookService.getCoverage(securityId, asOfDate, requireUserId(req));
       res.json(coverage);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // Execute research inquiry and synthesize snapshot
+  // Execute research inquiry and synthesize snapshot (owner stamped from the authenticated principal)
   app.post('/api/research/notebook/:securityId/execute', async (req, res) => {
     try {
       const { securityId } = req.params;
@@ -757,46 +790,43 @@ async function startServer() {
         customQuery,
         asOfDate,
         portfolioContext,
-        sourceFilter
+        sourceFilter,
+        ownerUserId: requireUserId(req)
       });
       res.json(snapshot);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // List historical research snapshots for a notebook
+  // List the caller's historical research snapshots for a notebook
   app.get('/api/research/notebook/:securityId/snapshots', (req, res) => {
     try {
+      const userId = requireUserId(req);
       const { securityId } = req.params;
       const canonical = resolveSecurity(securityId);
-      const notebookId = canonical ? `nb-${canonical.id}` : `nb-${securityId}`;
-      const snapshots = researchNotebookService.getSnapshots(notebookId);
+      const notebookId = researchNotebookService.notebookIdFor(canonical ? canonical.id : securityId, userId);
+      const snapshots = researchNotebookService.getSnapshotsForOwner(notebookId, userId);
       res.json({ snapshots, count: snapshots.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // Get a single research snapshot by ID
+  // Get a single research snapshot by ID (owner only; unknown ids are 404, foreign/legacy ids are 403)
   app.get('/api/research/snapshot/:snapshotId', async (req, res) => {
     try {
       const { snapshotId } = req.params;
-      const snapshot = researchNotebookService.getSnapshot(snapshotId);
-      if (!snapshot) {
-        res.status(404).json({ error: `Snapshot ${snapshotId} not found.` });
-        return;
-      }
-      await authorizationService.authorizeSnapshot(snapshotId, req.user?.userId || '');
+      const snapshot = await authorizationService.authorizeSnapshot(snapshotId, requireUserId(req));
       res.json(snapshot);
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
@@ -805,20 +835,22 @@ async function startServer() {
   // RESEARCH DOCUMENT INTELLIGENCE API (PHASE 14)
   // ==========================================
 
-  // Ingest & parse uploaded document
+  // Ingest & parse uploaded document (ownership is always the authenticated principal, never the request body)
   app.post('/api/documents/upload', async (req, res) => {
     try {
+      const userId = requireUserId(req);
       const payload = {
         ...req.body,
-        ownerUserId: req.user?.userId || undefined,
-        userId: req.user?.userId || undefined,
+        ownerUserId: userId,
+        userId,
+        visibility: 'PRIVATE',
         uploadedBy: req.user?.email || 'system'
       };
       const result = await documentIngestionService.ingestDocument(payload);
       res.status(200).json(result);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
@@ -829,63 +861,59 @@ async function startServer() {
       res.status(200).json(result);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
-  // Document Registry Stats
-  app.get('/api/documents/stats', (_req, res) => {
+  // Document Registry Stats (describes only documents the caller may read)
+  app.get('/api/documents/stats', (req, res) => {
     try {
-      const stats = documentRegistry.getStats();
+      const stats = documentRegistry.getStats(requireUserId(req));
       res.json(stats);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // List all registered research documents (optionally filtered by securityId)
+  // List the caller's registered research documents (optionally filtered by securityId)
   app.get('/api/documents', (req, res) => {
     try {
       const { securityId } = req.query;
-      const userId = req.user?.userId;
+      const userId = requireUserId(req);
       const docs = securityId
         ? documentRegistry.getDocumentsBySecurity(String(securityId), userId)
         : documentRegistry.getAllDocuments(userId);
       res.json({ documents: docs, count: docs.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // Get single document by ID
+  // Get single document by ID (owner only)
   app.get('/api/documents/:documentId', async (req, res) => {
     try {
       const { documentId } = req.params;
-      const doc = documentRegistry.getDocument(documentId);
-      if (!doc) {
-        res.status(404).json({ error: `Document ${documentId} not found.` });
-        return;
-      }
-      await authorizationService.authorizeDocument(documentId, req.user?.userId || '');
+      const doc = await authorizationService.authorizeDocument(documentId, requireUserId(req), 'read');
       res.json(doc);
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
 
-  // Delete document and purge its evidence from repository
+  // Delete document and purge its evidence from repository (owner only)
   app.delete('/api/documents/:documentId', async (req, res) => {
     try {
       const { documentId } = req.params;
-      await authorizationService.authorizeDocument(documentId, req.user?.userId || '');
-      const success = documentIngestionService.deleteDocument(documentId);
+      const userId = requireUserId(req);
+      await authorizationService.authorizeDocument(documentId, userId, 'write');
+      const success = await documentIngestionService.deleteDocumentForOwner(documentId, userId);
       if (!success) {
         res.status(404).json({ error: `Document ${documentId} not found.` });
         return;
@@ -893,10 +921,10 @@ async function startServer() {
       res.json({ success: true, deletedDocumentId: documentId });
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
@@ -952,7 +980,8 @@ async function startServer() {
       const analysis = await portfolioIntelligenceService.analyzePortfolioQuestion({
         query: query.trim(),
         portfolioContext,
-        asOfDate
+        asOfDate,
+        ownerUserId: requireUserId(req)
       });
 
       res.json(analysis);
@@ -966,14 +995,14 @@ async function startServer() {
   // WATCHLIST & ALERT INTELLIGENCE (PHASE 10)
   // ==========================================
 
-  // Watchlist endpoints
+  // Watchlist endpoints (strictly the caller's own items)
   app.get('/api/watchlist', (req, res) => {
     try {
-      const items = watchlistAlertService.getWatchlist(req.user?.userId);
+      const items = watchlistAlertService.getWatchlistForUser(requireUserId(req));
       res.json({ watchlist: items, count: items.length, timestamp: new Date().toISOString() });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
@@ -991,20 +1020,20 @@ async function startServer() {
         exchange,
         currency,
         notes,
-        ownerUserId: req.user?.userId
+        ownerUserId: requireUserId(req)
       });
       res.status(201).json(item);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
   app.delete('/api/watchlist/:id', async (req, res) => {
     try {
       const id = req.params.id;
-      await authorizationService.authorizeWatchlistItem(id, req.user?.userId || '');
-      const success = watchlistAlertService.removeWatchlistItem(id);
+      const item = await authorizationService.authorizeWatchlistItem(id, requireUserId(req), 'write');
+      const success = watchlistAlertService.removeWatchlistItem(item.watchlistItemId);
       if (!success) {
         res.status(404).json({ error: `Watchlist item ${id} not found` });
         return;
@@ -1012,10 +1041,10 @@ async function startServer() {
       res.json({ success: true, message: `Watchlist item ${id} removed` });
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
@@ -1023,9 +1052,9 @@ async function startServer() {
   app.patch('/api/watchlist/:id', async (req, res) => {
     try {
       const id = req.params.id;
-      await authorizationService.authorizeWatchlistItem(id, req.user?.userId || '');
+      const item = await authorizationService.authorizeWatchlistItem(id, requireUserId(req), 'write');
       const { enabled } = req.body || {};
-      const updated = watchlistAlertService.toggleWatchlistItem(id, enabled);
+      const updated = watchlistAlertService.toggleWatchlistItem(item.watchlistItemId, enabled);
       if (!updated) {
         res.status(404).json({ error: `Watchlist item ${id} not found` });
         return;
@@ -1033,10 +1062,10 @@ async function startServer() {
       res.json(updated);
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
@@ -1048,12 +1077,11 @@ async function startServer() {
       const symbol = req.query.symbol as string | undefined;
       const enabled = req.query.enabled !== undefined ? req.query.enabled === 'true' : undefined;
       const alertType = req.query.alertType as any;
-      const userId = req.user?.userId;
-      const rules = watchlistAlertService.getAlertRules({ securityId, symbol, enabled, alertType, userId });
+      const rules = watchlistAlertService.getAlertRulesForUser(requireUserId(req), { securityId, symbol, enabled, alertType });
       res.json({ rules, count: rules.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
@@ -1075,22 +1103,22 @@ async function startServer() {
         cooldownMinutes,
         enabled,
         metadata,
-        ownerUserId: req.user?.userId
+        ownerUserId: requireUserId(req)
       });
       res.status(201).json(rule);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
   app.patch('/api/alerts/rules/:id', async (req, res) => {
     try {
       const id = req.params.id;
-      if (req.user?.userId) {
-        await authorizationService.authorizeAlertRule(id, req.user.userId);
-      }
-      const updated = watchlistAlertService.updateAlertRule(id, req.body || {});
+      await authorizationService.authorizeAlertRule(id, requireUserId(req), 'write');
+      // Ownership/identity fields are server-controlled and can never be changed by the client.
+      const { ownerUserId: _o, userId: _u, tenantId: _t, visibility: _v, alertRuleId: _id, ...safeUpdates } = req.body || {};
+      const updated = watchlistAlertService.updateAlertRule(id, safeUpdates);
       if (!updated) {
         res.status(404).json({ error: `Alert rule ${id} not found` });
         return;
@@ -1098,10 +1126,10 @@ async function startServer() {
       res.json(updated);
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
@@ -1109,7 +1137,7 @@ async function startServer() {
   app.delete('/api/alerts/rules/:id', async (req, res) => {
     try {
       const id = req.params.id;
-      await authorizationService.authorizeAlertRule(id, req.user?.userId || '');
+      await authorizationService.authorizeAlertRule(id, requireUserId(req), 'write');
       const success = watchlistAlertService.deleteAlertRule(id);
       if (!success) {
         res.status(404).json({ error: `Alert rule ${id} not found` });
@@ -1118,10 +1146,10 @@ async function startServer() {
       res.json({ success: true, message: `Alert rule ${id} deleted` });
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
@@ -1133,43 +1161,46 @@ async function startServer() {
       const priority = req.query.priority as any;
       const securityId = req.query.securityId as string | undefined;
       const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : undefined;
-      const userId = req.user?.userId;
-      const events = watchlistAlertService.getAlertEvents({ isRead, priority, securityId, limit, userId });
+      const events = watchlistAlertService.getAlertEventsForUser(requireUserId(req), { isRead, priority, securityId, limit });
       res.json({ events, count: events.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
   app.post('/api/alerts/evaluate', async (req, res) => {
     try {
       const { force, asOfDate } = req.body || {};
-      const result = await watchlistAlertService.evaluateAll({ force, asOfDate });
+      // Evaluation is scoped to the caller's own rules and watchlist; it can never touch other tenants' alert state.
+      const result = await watchlistAlertService.evaluateAll({ force, asOfDate, ownerUserId: requireUserId(req) });
       res.json(result);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
   app.post('/api/alerts/:id/analyze', async (req, res) => {
     try {
       const eventId = req.params.id;
+      await authorizationService.authorizeAlertEvent(eventId, requireUserId(req), 'write');
       const analysis = await watchlistAlertService.generateContextForAlert(eventId);
       res.json({ eventId, contextualAnalysis: analysis });
     } catch (error: unknown) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      if (error instanceof AuthorizationError) {
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
+      } else {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        res.status(statusForError(error, 500)).json({ error: errMsg });
+      }
     }
   });
 
   app.post('/api/alerts/:id/read', async (req, res) => {
     try {
       const eventId = req.params.id;
-      if (req.user?.userId) {
-        await authorizationService.authorizeAlertEvent(eventId, req.user.userId);
-      }
+      await authorizationService.authorizeAlertEvent(eventId, requireUserId(req), 'write');
       const event = watchlistAlertService.markAlertRead(eventId);
       if (!event) {
         res.status(404).json({ error: `Alert event ${eventId} not found` });
@@ -1178,10 +1209,10 @@ async function startServer() {
       res.json(event);
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
@@ -1189,9 +1220,7 @@ async function startServer() {
   app.post('/api/alerts/:id/acknowledge', async (req, res) => {
     try {
       const eventId = req.params.id;
-      if (req.user?.userId) {
-        await authorizationService.authorizeAlertEvent(eventId, req.user.userId);
-      }
+      await authorizationService.authorizeAlertEvent(eventId, requireUserId(req), 'write');
       const event = watchlistAlertService.acknowledgeAlert(eventId);
       if (!event) {
         res.status(404).json({ error: `Alert event ${eventId} not found` });
@@ -1200,10 +1229,10 @@ async function startServer() {
       res.json(event);
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
@@ -1228,11 +1257,11 @@ async function startServer() {
     }
   });
 
-  // Get details for a specific strategy
+  // Get details for a specific strategy (built-in: any authenticated user; custom: owner only)
   app.get('/api/strategies/:id', async (req, res) => {
     try {
       const strategyId = req.params.id;
-      await authorizationService.authorizeStrategy(strategyId, req.user?.userId || '');
+      await authorizationService.authorizeStrategy(strategyId, requireUserId(req), 'read');
       const strategy = quantStrategyEngine.getStrategy(strategyId);
       if (!strategy) {
         res.status(404).json({ error: `Strategy '${strategyId}' not found` });
@@ -1241,10 +1270,10 @@ async function startServer() {
       res.json(strategy);
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
@@ -1252,7 +1281,11 @@ async function startServer() {
   // Evaluate a quantitative strategy for a security
   app.post('/api/strategies/evaluate', async (req, res) => {
     try {
-      const { strategyId, symbol, market, exchange, currency, parameters, asOfDate, portfolioContext } = req.body;
+      const { strategyId, symbol, market, exchange, currency, parameters, asOfDate, portfolioContext } = req.body || {};
+      if (strategyId) {
+        // A custom strategy owned by someone else (or unowned legacy) must not be evaluable.
+        await authorizationService.authorizeStrategy(strategyId, requireUserId(req), 'read');
+      }
       const result = await quantStrategyEngine.evaluateStrategy({
         strategyId,
         symbol,
@@ -1265,8 +1298,12 @@ async function startServer() {
       });
       res.json(result);
     } catch (error: unknown) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      if (error instanceof AuthorizationError) {
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
+      } else {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        res.status(statusForError(error, 500)).json({ error: errMsg });
+      }
     }
   });
 
@@ -1282,14 +1319,22 @@ async function startServer() {
     }
   });
 
-  // Register a custom quantitative strategy
-  app.post('/api/strategies/custom', (req, res) => {
+  // Register a custom quantitative strategy (owner stamped from the principal; cannot shadow built-ins or others' strategies)
+  app.post('/api/strategies/custom', async (req, res) => {
     try {
+      const userId = requireUserId(req);
+      const { isBuiltIn: _b, visibility: _v, tenantId: _t, ...body } = req.body || {};
       const strategy = {
-        ...req.body,
-        ownerUserId: req.user?.userId || undefined,
-        userId: req.user?.userId || undefined
+        ...body,
+        isBuiltIn: false,
+        ownerUserId: userId,
+        userId,
+        visibility: 'PRIVATE' as const
       };
+      if (strategy.strategyId && quantStrategyEngine.getStrategy(strategy.strategyId)) {
+        // Re-registering is allowed only for the owner of an existing custom strategy.
+        await authorizationService.authorizeStrategy(strategy.strategyId, userId, 'write');
+      }
       const result = quantStrategyEngine.registerCustomStrategy(strategy);
       if (!result.valid) {
         res.status(400).json({ error: 'Validation failed', errors: result.errors });
@@ -1297,8 +1342,12 @@ async function startServer() {
       }
       res.json({ message: 'Strategy registered successfully', strategyId: strategy.strategyId });
     } catch (error: unknown) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      if (error instanceof AuthorizationError) {
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
+      } else {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        res.status(statusForError(error, 500)).json({ error: errMsg });
+      }
     }
   });
 
@@ -1306,13 +1355,16 @@ async function startServer() {
   // PHASE 12A - BACKTESTING ENGINE API ROUTES
   // ==========================================
 
-  // Execute a deterministic backtest
+  // Execute a deterministic backtest (owner stamped from the principal; identity fields are never client-controlled)
   app.post('/api/backtests/run', async (req, res) => {
     try {
-      const config = req.body.config || req.body;
-      if (config && req.user?.userId) {
-        config.ownerUserId = req.user.userId;
+      const userId = requireUserId(req);
+      const raw = req.body?.config || req.body || {};
+      const { ownerUserId: _o, userId: _u, tenantId: _t, visibility: _v, backtestId: _b, id: _id, ...clean } = raw;
+      if (clean.strategyId) {
+        await authorizationService.authorizeStrategy(clean.strategyId, userId, 'read');
       }
+      const config = { ...clean, ownerUserId: userId, userId, visibility: 'PRIVATE' };
       const result = await backtestService.runBacktest(config);
       res.json({
         success: result.status === 'COMPLETED',
@@ -1320,8 +1372,12 @@ async function startServer() {
         ...result
       });
     } catch (error: unknown) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ success: false, error: errMsg });
+      if (error instanceof AuthorizationError) {
+        res.status(error.statusCode).json({ success: false, error: error.message, code: error.code });
+      } else {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        res.status(statusForError(error, 500)).json({ success: false, error: errMsg });
+      }
     }
   });
 
@@ -1337,60 +1393,45 @@ async function startServer() {
     }
   });
 
-  // Retrieve a backtest result by ID
+  // Retrieve a backtest result by ID (owner only)
   app.get('/api/backtests/:id', async (req, res) => {
     try {
       const { id } = req.params;
-      await authorizationService.authorizeBacktest(id, req.user?.userId || '');
-      const result = backtestService.getBacktest(id);
-      if (!result) {
-        res.status(404).json({ error: `Backtest with ID '${id}' not found` });
-        return;
-      }
+      const result = await authorizationService.authorizeBacktest(id, requireUserId(req), 'read');
       res.json(result);
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
 
-  // Retrieve all cached backtest results
+  // Retrieve the caller's backtest results
   app.get('/api/backtests', (req, res) => {
     try {
-      let backtests = backtestService.getAllBacktests();
-      if (req.user?.userId) {
-        backtests = backtests.filter(b => !b.ownerUserId || b.ownerUserId === req.user?.userId);
-      } else {
-        backtests = backtests.filter(b => !b.ownerUserId);
-      }
+      const backtests = backtestService.getAllBacktestsForOwner(requireUserId(req));
       res.json({ backtests, count: backtests.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // Retrieve comprehensive backtest report by ID
+  // Retrieve comprehensive backtest report by ID (owner only)
   app.get('/api/backtests/:id/report', async (req, res) => {
     try {
       const { id } = req.params;
-      await authorizationService.authorizeBacktest(id, req.user?.userId || '');
-      const result = backtestService.getBacktest(id);
-      if (!result) {
-        res.status(404).json({ error: `Backtest with ID '${id}' not found` });
-        return;
-      }
+      const result = await authorizationService.authorizeBacktest(id, requireUserId(req), 'read');
       res.json(result.report || { error: 'Report not generated for backtest' });
     } catch (error: unknown) {
       if (error instanceof AuthorizationError) {
-        res.status(error.statusCode).json({ error: error.message });
+        res.status(error.statusCode).json({ error: error.message, code: error.code });
       } else {
         const errMsg = error instanceof Error ? error.message : String(error);
-        res.status(500).json({ error: errMsg });
+        res.status(statusForError(error, 500)).json({ error: errMsg });
       }
     }
   });
@@ -1407,12 +1448,13 @@ async function startServer() {
       const assessment = await decisionIntelligenceService.evaluateDecision({
         securityId,
         asOfDate,
-        forceRefresh: req.query.refresh === 'true'
+        forceRefresh: req.query.refresh === 'true',
+        ownerUserId: requireUserId(req)
       });
       res.json(assessment);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
@@ -1424,7 +1466,14 @@ async function startServer() {
         res.status(400).json({ error: 'securityId is required in request body.' });
         return;
       }
-      const assessment = await decisionIntelligenceService.evaluateDecision(request);
+      // Ownership comes from the principal; any owner/tenant fields in the body are ignored.
+      const assessment = await decisionIntelligenceService.evaluateDecision({
+        securityId: request.securityId,
+        asOfDate: request.asOfDate,
+        configuration: request.configuration,
+        forceRefresh: request.forceRefresh,
+        ownerUserId: requireUserId(req)
+      });
       res.json(assessment);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
@@ -1439,7 +1488,8 @@ async function startServer() {
       const assessment = await decisionIntelligenceService.evaluateDecision({
         securityId,
         asOfDate: date,
-        forceRefresh: req.query.refresh === 'true'
+        forceRefresh: req.query.refresh === 'true',
+        ownerUserId: requireUserId(req)
       });
       res.json(assessment);
     } catch (error: unknown) {
@@ -1456,7 +1506,7 @@ async function startServer() {
         res.status(400).json({ error: 'Both securityIdA and securityIdB are required in request body.' });
         return;
       }
-      const comparison = await decisionIntelligenceService.compareDecisions(request);
+      const comparison = await decisionIntelligenceService.compareDecisions({ ...request, ownerUserId: requireUserId(req) });
       res.json(comparison);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
@@ -1476,11 +1526,11 @@ async function startServer() {
         res.status(400).json({ error: 'securityId is required' });
         return;
       }
-      const timeline = await decisionDeltaEngine.getTimeline(securityId);
+      const timeline = await decisionDeltaEngine.getTimeline(securityId, requireUserId(req));
       res.json(timeline);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/decisions/:securityId/timeline', handleTimeline);
@@ -1490,24 +1540,25 @@ async function startServer() {
   const handleDelta = async (req: express.Request, res: express.Response) => {
     try {
       const { securityId, fromDecisionId, toDecisionId } = req.query as Record<string, string>;
+      const ownerId = requireUserId(req);
       if (!securityId) {
         res.status(400).json({ error: 'securityId query parameter is required.' });
         return;
       }
       if (fromDecisionId && toDecisionId) {
-        const delta = await decisionDeltaEngine.getDeltaBetweenDecisions(securityId, fromDecisionId, toDecisionId);
+        const delta = await decisionDeltaEngine.getDeltaBetweenDecisions(securityId, fromDecisionId, toDecisionId, ownerId);
         res.json(delta);
         return;
       }
       if (toDecisionId) {
-        const delta = await decisionDeltaEngine.getAdjacentDelta(securityId, toDecisionId);
+        const delta = await decisionDeltaEngine.getAdjacentDelta(securityId, toDecisionId, ownerId);
         res.json(delta);
         return;
       }
       res.status(400).json({ error: 'toDecisionId query parameter (and optionally fromDecisionId) is required.' });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/decisions/delta', handleDelta);
@@ -1521,11 +1572,11 @@ async function startServer() {
         res.status(400).json({ error: 'securityIds array is required in request body.' });
         return;
       }
-      const result = await decisionIntelligenceService.comparePeers(request);
+      const result = await decisionIntelligenceService.comparePeers({ ...request, ownerUserId: requireUserId(req) });
       res.json(result);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.post('/api/decisions/compare-peers', handleComparePeers);
@@ -1548,7 +1599,7 @@ async function startServer() {
       res.json(timeline);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/events/:securityId/timeline', handleEventTimeline);
@@ -1581,11 +1632,16 @@ async function startServer() {
         res.status(400).json({ error: 'eventId, securityId, and eventType are required.' });
         return;
       }
+      // Events are shared reference data. Writing to the shared pool is an operator action (ADMIN_USER_IDS).
+      if (!isAdminUser(req.user?.userId)) {
+        res.status(403).json({ error: 'Forbidden', code: 'ADMIN_REQUIRED', message: 'Recording shared investment events requires an administrator.' });
+        return;
+      }
       const saved = await investmentEventEngine.recordEvent(eventData);
       res.status(201).json(saved);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.post('/api/events/record', handleRecordEvent);
@@ -1600,6 +1656,8 @@ async function startServer() {
         res.json(timeline.events);
         return;
       }
+      // Investment events are shared reference data derived from public disclosures (read-only for any
+      // authenticated user; writes are operator-only, see /api/events/record).
       const allEvents = await persistenceManager.getEventRepository().getAll();
       res.json(allEvents);
     } catch (error: unknown) {
@@ -1615,7 +1673,7 @@ async function startServer() {
   // List all monitors owned by user
   const handleListMonitors = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const monitors = await investmentMonitorEngine.getMonitors(userId);
       res.json(monitors);
     } catch (error: unknown) {
@@ -1629,7 +1687,7 @@ async function startServer() {
   // Create or register a new monitor
   const handleCreateMonitor = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { securityId, reviewCadence } = req.body || {};
       if (!securityId) {
         res.status(400).json({ error: 'securityId is required' });
@@ -1639,7 +1697,7 @@ async function startServer() {
       res.status(201).json(monitor);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.post('/api/monitors', handleCreateMonitor);
@@ -1648,7 +1706,7 @@ async function startServer() {
   // Get single monitor
   const handleGetMonitor = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { monitorId } = req.params;
       const monitor = await investmentMonitorEngine.getMonitor(monitorId, userId);
       if (!monitor) {
@@ -1671,14 +1729,14 @@ async function startServer() {
   // Update monitor settings (cadence, status)
   const handleUpdateMonitor = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { monitorId } = req.params;
       const updates = req.body || {};
       const updated = await investmentMonitorEngine.updateMonitor(monitorId, userId, updates);
       res.json(updated);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.put('/api/monitors/:monitorId', handleUpdateMonitor);
@@ -1687,13 +1745,13 @@ async function startServer() {
   // Delete monitor
   const handleDeleteMonitor = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { monitorId } = req.params;
       const success = await investmentMonitorEngine.deleteMonitor(monitorId, userId);
       res.json({ success, monitorId });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.delete('/api/monitors/:monitorId', handleDeleteMonitor);
@@ -1702,14 +1760,14 @@ async function startServer() {
   // Detect all changes ("What Changed?") with PIT support
   const handleDetectChanges = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { monitorId } = req.params;
       const asOfDate = req.query.asOfDate as string | undefined;
       const reviewDraft = await investmentMonitorEngine.detectAllChanges(monitorId, userId, asOfDate);
       res.json(reviewDraft);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/monitors/:monitorId/changes', handleDetectChanges);
@@ -1718,14 +1776,14 @@ async function startServer() {
   // Execute and commit an immutable review
   const handleExecuteReview = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { monitorId } = req.params;
       const { analystNote, reviewAction } = req.body || {};
       const review = await investmentMonitorEngine.executeReview(monitorId, userId, analystNote, reviewAction);
       res.status(201).json(review);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.post('/api/monitors/:monitorId/review', handleExecuteReview);
@@ -1736,7 +1794,7 @@ async function startServer() {
   // Compare two historical reviews point-in-time
   const handleCompareReviews = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { monitorId } = req.params;
       const { baseReviewId, targetReviewId } = req.query;
       if (!baseReviewId || !targetReviewId) {
@@ -1752,7 +1810,7 @@ async function startServer() {
       res.json(comparison);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/monitors/:monitorId/reviews/compare', handleCompareReviews);
@@ -1761,13 +1819,13 @@ async function startServer() {
   // Get historical review history for monitor
   const handleGetReviewHistory = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { monitorId } = req.params;
       const history = await investmentMonitorEngine.getReviewHistory(monitorId, userId);
       res.json(history);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/monitors/:monitorId/reviews', handleGetReviewHistory);
@@ -1776,7 +1834,7 @@ async function startServer() {
   // Get specific historical review
   const handleGetReview = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { reviewId } = req.params;
       const review = await investmentMonitorEngine.getReview(reviewId, userId);
       if (!review) {
@@ -1786,7 +1844,7 @@ async function startServer() {
       res.json(review);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/monitors/reviews/:reviewId', handleGetReview);
@@ -1795,7 +1853,7 @@ async function startServer() {
   // Add analyst review note
   const handleAddNote = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { monitorId } = req.params;
       const { content, reviewId, authorName } = req.body || {};
       if (!content || !content.trim()) {
@@ -1812,7 +1870,7 @@ async function startServer() {
       res.status(201).json(note);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.post('/api/monitors/:monitorId/notes', handleAddNote);
@@ -1821,13 +1879,13 @@ async function startServer() {
   // Get notes for monitor
   const handleGetNotes = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { monitorId } = req.params;
       const notes = await investmentMonitorEngine.getAnalystNotes(monitorId, userId);
       res.json(notes);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/monitors/:monitorId/notes', handleGetNotes);
@@ -1840,12 +1898,12 @@ async function startServer() {
   // Get monitoring policies (seeds default policies if none exist)
   const handleGetPolicies = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const policies = await alertOrchestrationEngine.getPolicies(userId);
       res.json(policies);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/policies', handleGetPolicies);
@@ -1854,11 +1912,16 @@ async function startServer() {
   // Create or update a monitoring policy
   const handleSavePolicy = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const policyData = req.body;
       if (!policyData || !policyData.name || !policyData.policyType) {
         res.status(400).json({ error: 'Policy name and policyType are required.' });
         return;
+      }
+      if (policyData.policyId) {
+        // Updating an existing policy id requires owning it; this also blocks overwriting another tenant's policy.
+        const existing = await persistenceManager.getPolicyRepository().get(policyData.policyId);
+        if (existing) await authorizationService.authorizePolicy(policyData.policyId, userId, 'write');
       }
       const policyId = policyData.policyId || `policy_${userId}_${Date.now()}`;
       const policy = {
@@ -1883,7 +1946,7 @@ async function startServer() {
       res.status(201).json(saved);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.post('/api/policies', handleSavePolicy);
@@ -1892,7 +1955,7 @@ async function startServer() {
   // Delete a monitoring policy
   const handleDeletePolicy = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { policyId } = req.params;
       await authorizationService.authorizePolicy(policyId, userId);
       const deleted = await persistenceManager.getPolicyRepository().delete(policyId);
@@ -1909,13 +1972,13 @@ async function startServer() {
   // Run a continuous monitoring cycle
   const handleRunMonitoringCycle = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { monitorId, asOfDate } = req.body || {};
       const result = await alertOrchestrationEngine.runMonitoringCycle(userId, { monitorId, asOfDate });
       res.json(result);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.post('/api/orchestration/cycle', handleRunMonitoringCycle);
@@ -1924,7 +1987,7 @@ async function startServer() {
   // Get orchestrated alerts (with filtering)
   const handleGetAlerts = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { status, severity, monitorId, securityId, limit } = req.query as Record<string, string | undefined>;
       const alerts = await persistenceManager.getAlertOrchestrationRepository().getByUserId(userId, {
         status: status as any,
@@ -1936,7 +1999,7 @@ async function startServer() {
       res.json(alerts);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/orchestrated-alerts', handleGetAlerts);
@@ -1945,7 +2008,7 @@ async function startServer() {
   // Get single orchestrated alert
   const handleGetSingleAlert = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { alertId } = req.params;
       const alert = await authorizationService.authorizeOrchestratedAlert(alertId, userId);
       res.json(alert);
@@ -1961,7 +2024,7 @@ async function startServer() {
   // Acknowledge alert
   const handleAcknowledgeAlert = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { alertId } = req.params;
       const { note } = req.body || {};
       const updated = await alertOrchestrationEngine.acknowledgeAlert(alertId, userId, note);
@@ -1978,7 +2041,7 @@ async function startServer() {
   // Open review for alert (records audit event)
   const handleOpenReviewForAlert = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { alertId } = req.params;
       const updated = await alertOrchestrationEngine.openReviewForAlert(alertId, userId);
       res.json(updated);
@@ -1994,7 +2057,7 @@ async function startServer() {
   // Dismiss alert
   const handleDismissAlert = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { alertId } = req.params;
       const { note } = req.body || {};
       const updated = await alertOrchestrationEngine.dismissAlert(alertId, userId, note);
@@ -2011,7 +2074,7 @@ async function startServer() {
   // Resolve alert
   const handleResolveAlert = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { alertId } = req.params;
       const { note } = req.body || {};
       const updated = await alertOrchestrationEngine.resolveAlert(alertId, userId, note);
@@ -2032,7 +2095,7 @@ async function startServer() {
   // Get research priorities / attention queue
   const handleGetPriorities = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const {
         universe,
         market,
@@ -2060,7 +2123,7 @@ async function startServer() {
       res.json(snapshot);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/discovery/priorities', handleGetPriorities);
@@ -2070,7 +2133,7 @@ async function startServer() {
   // Get single security research priority
   const handleGetSecurityPriority = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { securityId } = req.params;
       const { asOfDate } = req.query as Record<string, string | undefined>;
 
@@ -2082,7 +2145,7 @@ async function startServer() {
       res.json(item);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/discovery/priorities/:securityId', handleGetSecurityPriority);
@@ -2092,7 +2155,7 @@ async function startServer() {
   // Refresh research priority discovery snapshot
   const handleRefreshPriorities = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { universe, asOfDate, market } = req.body || {};
 
       const snapshot = await researchPrioritizationEngine.generatePrioritization(userId, {
@@ -2104,7 +2167,7 @@ async function startServer() {
       res.status(201).json(snapshot);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.post('/api/discovery/refresh', handleRefreshPriorities);
@@ -2122,7 +2185,7 @@ async function startServer() {
       res.json({ briefing });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.post('/api/discovery/briefing', handleGenerateBriefing);
@@ -2130,12 +2193,12 @@ async function startServer() {
   // List historical discovery snapshots
   const handleGetDiscoverySnapshots = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const snapshots = await persistenceManager.getResearchPriorityRepository().getSnapshotsByUserId(userId);
       res.json(snapshots);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
   app.get('/api/discovery/snapshots', handleGetDiscoverySnapshots);
@@ -2143,7 +2206,7 @@ async function startServer() {
   // Get specific historical discovery snapshot
   const handleGetSingleDiscoverySnapshot = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { snapshotId } = req.params;
       const snapshot = await authorizationService.authorizeResearchPrioritySnapshot(snapshotId, userId);
       res.json(snapshot);
@@ -2161,7 +2224,7 @@ async function startServer() {
 
   const handleGetCommandCenter = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { scope, asOfDate, market, limit } = req.query as Record<string, string | undefined>;
 
       const data = await researchCommandCenterService.getCommandCenterData(userId, {
@@ -2174,13 +2237,13 @@ async function startServer() {
       res.json(data);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
   const handlePostCommandCenter = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { scope, asOfDate, market, limit } = req.body || {};
 
       const data = await researchCommandCenterService.getCommandCenterData(userId, {
@@ -2193,7 +2256,7 @@ async function startServer() {
       res.json(data);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
@@ -2208,7 +2271,7 @@ async function startServer() {
 
   const handleGetCrossInvestment = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { scope, asOfDate, market, sector, relationshipType, securityId, limit } = req.query as Record<string, string | undefined>;
 
       const data = await crossInvestmentService.getCrossInvestmentData(userId, {
@@ -2224,13 +2287,13 @@ async function startServer() {
       res.json(data);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
   const handlePostCrossInvestment = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { scope, asOfDate, market, sector, relationshipType, securityId, limit } = req.body || {};
 
       const data = await crossInvestmentService.getCrossInvestmentData(userId, {
@@ -2246,7 +2309,7 @@ async function startServer() {
       res.json(data);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
@@ -2258,7 +2321,7 @@ async function startServer() {
   // Single Security Relationships Network
   app.get('/api/cross-investment/relationships/:securityId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const securityId = req.params.securityId;
       const { asOfDate, relationshipType } = req.query as Record<string, string | undefined>;
 
@@ -2271,14 +2334,14 @@ async function startServer() {
       res.json(data);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Clusters endpoint
   app.get('/api/cross-investment/clusters', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { asOfDate, market } = req.query as Record<string, string | undefined>;
 
       const data = await crossInvestmentService.getCrossInvestmentData(userId, {
@@ -2289,14 +2352,14 @@ async function startServer() {
       res.json(data.clusters);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Common Drivers endpoint
   app.get('/api/cross-investment/drivers', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { asOfDate, market } = req.query as Record<string, string | undefined>;
 
       const data = await crossInvestmentService.getCrossInvestmentData(userId, {
@@ -2307,14 +2370,14 @@ async function startServer() {
       res.json(data.commonDrivers);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Snapshots Persistence
   app.post('/api/cross-investment/snapshots', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { title, data } = req.body || {};
       if (!data) {
         return res.status(400).json({ error: 'data is required to create a snapshot' });
@@ -2324,24 +2387,24 @@ async function startServer() {
       res.status(201).json(snapshot);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   app.get('/api/cross-investment/snapshots', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const snapshots = await crossInvestmentService.getSnapshotsByUserId(userId);
       res.json(snapshots);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   app.get('/api/cross-investment/snapshots/:snapshotId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const snapshot = await crossInvestmentService.getSnapshot(req.params.snapshotId, userId);
       if (!snapshot) {
         return res.status(404).json({ error: `Snapshot not found: ${req.params.snapshotId}` });
@@ -2352,7 +2415,7 @@ async function startServer() {
       if (errMsg.includes('Forbidden')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
@@ -2362,7 +2425,7 @@ async function startServer() {
 
   const handleEvaluateScenario = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const request = req.body;
       if (!request || !request.scenarioType) {
         return res.status(400).json({ error: 'scenarioType is required in evaluation request' });
@@ -2371,7 +2434,7 @@ async function startServer() {
       res.json(evaluation);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
@@ -2384,7 +2447,7 @@ async function startServer() {
       res.json(presets);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
@@ -2393,7 +2456,7 @@ async function startServer() {
 
   const handleCompareScenarios = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { scenarios } = req.body || {};
       if (!Array.isArray(scenarios) || scenarios.length === 0) {
         return res.status(400).json({ error: 'scenarios array is required to compare' });
@@ -2402,7 +2465,7 @@ async function startServer() {
       res.json(comparison);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
@@ -2412,36 +2475,38 @@ async function startServer() {
   // Scenario Snapshots
   app.post('/api/scenarios/snapshots', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const snapshot = req.body;
       if (!snapshot || !snapshot.evaluation) {
         return res.status(400).json({ error: 'evaluation is required in snapshot body' });
       }
+      // The snapshot owner is always the authenticated principal; a client-supplied userId/ownerUserId is ignored.
       const saved = await portfolioScenarioService.saveSnapshot({
         ...snapshot,
-        userId: snapshot.userId || userId
+        userId,
+        ownerUserId: userId
       });
       res.json(saved);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   app.get('/api/scenarios/snapshots', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const snapshots = await portfolioScenarioService.getSnapshotsByUserId(userId);
       res.json(snapshots);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   app.get('/api/scenarios/snapshots/:snapshotId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const snapshot = await portfolioScenarioService.getSnapshot(req.params.snapshotId, userId);
       if (!snapshot) {
         return res.status(404).json({ error: `Snapshot not found: ${req.params.snapshotId}` });
@@ -2452,7 +2517,7 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Forbidden') || errMsg.includes('not authorized')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
@@ -2461,12 +2526,12 @@ async function startServer() {
   // ==========================================
   const handleEvaluateCounterfactual = async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const result = await counterfactualDecisionService.evaluateCounterfactual(userId, req.body);
       res.json(result);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
@@ -2477,11 +2542,11 @@ async function startServer() {
     try {
       const securityId = req.params.id;
       const asOfDate = req.query.asOfDate as string | undefined;
-      const sensitivity = await counterfactualDecisionService.getSensitivity(securityId, asOfDate);
+      const sensitivity = await counterfactualDecisionService.getSensitivity(securityId, asOfDate, requireUserId(req));
       res.json(sensitivity);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
@@ -2491,11 +2556,11 @@ async function startServer() {
   const handleGetDecisionTraceability = async (req: express.Request, res: express.Response) => {
     try {
       const decisionId = req.params.id;
-      const traceability = await counterfactualDecisionService.getTraceability(decisionId);
+      const traceability = await counterfactualDecisionService.getTraceability(decisionId, requireUserId(req));
       res.json(traceability);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
@@ -2512,7 +2577,7 @@ async function startServer() {
       res.json(comparison);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   };
 
@@ -2522,36 +2587,38 @@ async function startServer() {
   // Counterfactual Snapshots
   app.post('/api/counterfactuals/snapshots', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const snapshot = req.body;
       if (!snapshot || !snapshot.evaluation) {
         return res.status(400).json({ error: 'evaluation is required in snapshot body' });
       }
+      // The snapshot owner is always the authenticated principal; a client-supplied userId/ownerUserId is ignored.
       const saved = await counterfactualDecisionService.saveSnapshot({
         ...snapshot,
-        userId: snapshot.userId || userId
+        userId,
+        ownerUserId: userId
       });
       res.json(saved);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   app.get('/api/counterfactuals/snapshots', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const snapshots = await counterfactualDecisionService.getSnapshotsByUserId(userId);
       res.json(snapshots);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   app.get('/api/counterfactuals/snapshots/:snapshotId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const snapshot = await counterfactualDecisionService.getSnapshot(req.params.snapshotId, userId);
       if (!snapshot) {
         return res.status(404).json({ error: `Snapshot not found: ${req.params.snapshotId}` });
@@ -2562,7 +2629,7 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Forbidden') || errMsg.includes('not authorized')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
@@ -2573,7 +2640,7 @@ async function startServer() {
   // Create Research Memory
   app.post('/api/research-memory', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const created = await researchMemoryService.createMemory(userId, req.body);
       res.json(created);
     } catch (error: unknown) {
@@ -2581,14 +2648,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Get Research Memory Timeline (Strict Point-in-Time)
   app.get('/api/research-memory/timeline/:securityId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const securityId = req.params.securityId;
       const asOfDate = req.query.asOfDate as string | undefined;
       const memoryType = req.query.memoryType as any;
@@ -2600,14 +2667,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Get Current Research State (Knowledge continuity synthesis)
   app.get('/api/research-memory/current/:securityId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const securityId = req.params.securityId;
       const asOfDate = req.query.asOfDate as string | undefined;
       const state = await researchMemoryService.getCurrentResearchState(userId, securityId, asOfDate);
@@ -2617,14 +2684,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Get Knowledge Evolution Graph
   app.get('/api/research-memory/evolution/:securityId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const securityId = req.params.securityId;
       const asOfDate = req.query.asOfDate as string | undefined;
       const graph = await researchMemoryService.getEvolutionGraph(userId, securityId, asOfDate);
@@ -2634,14 +2701,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Search Research Memories
   app.get('/api/research-memory/search', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const results = await researchMemoryService.searchMemories(userId, req.query as any);
       res.json(results);
     } catch (error: unknown) {
@@ -2649,14 +2716,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Open Research Questions: List for security
   app.get('/api/research-memory/questions/:securityId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const securityId = req.params.securityId;
       const asOfDate = req.query.asOfDate as string | undefined;
       const repo = persistenceManager.getResearchQuestionRepository();
@@ -2667,14 +2734,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Create Research Question
   app.post('/api/research-memory/questions', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const question = await researchMemoryService.createQuestion(userId, req.body);
       res.json(question);
     } catch (error: unknown) {
@@ -2682,14 +2749,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Update Research Question Status
   app.patch('/api/research-memory/questions/:id', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { status, resolution } = req.body;
       const updated = await researchMemoryService.updateQuestionStatus(userId, req.params.id, status, resolution);
       res.json(updated);
@@ -2698,14 +2765,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Supersede Research Memory
   app.post('/api/research-memory/:id/supersede', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const result = await researchMemoryService.supersedeMemory(userId, req.params.id, req.body);
       res.json(result);
     } catch (error: unknown) {
@@ -2713,14 +2780,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Get Single Research Memory by ID
   app.get('/api/research-memory/:id', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const memory = await researchMemoryService.getMemory(userId, req.params.id);
       res.json(memory);
     } catch (error: unknown) {
@@ -2731,7 +2798,7 @@ async function startServer() {
       if (errMsg.includes('not found') || errMsg.includes('404')) {
         return res.status(404).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
@@ -2742,7 +2809,7 @@ async function startServer() {
   // List Research Questions
   app.get('/api/research/questions', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const securityId = req.query.securityId as string | undefined;
       const status = req.query.status as any;
       const category = req.query.category as any;
@@ -2764,26 +2831,26 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Create Research Question
   app.post('/api/research/questions', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const question = await researchQuestionService.createQuestion(userId, req.body);
       res.status(201).json(question);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Get Single Question by ID
   app.get('/api/research/questions/:id', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const q = await researchQuestionService.getQuestion(userId, req.params.id);
       res.json(q);
     } catch (error: unknown) {
@@ -2794,14 +2861,14 @@ async function startServer() {
       if (errMsg.includes('not found') || errMsg.includes('404')) {
         return res.status(404).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Update Question Status / Resolution
   app.patch('/api/research/questions/:id', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { status, resolution, reason, attachedEvidenceIds, asOfDate } = req.body;
       const updated = await researchQuestionService.updateQuestionStatus(userId, req.params.id, status, {
         resolution,
@@ -2815,14 +2882,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Deterministically Evaluate Question Completion
   app.post('/api/research/questions/:id/evaluate', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { availableEvidenceIds, resolutionNarrative } = req.body;
       const evaluated = await researchQuestionService.evaluateQuestionCompletion(
         userId,
@@ -2833,27 +2900,27 @@ async function startServer() {
       res.json(evaluated);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Generate Questions for Security
   app.post('/api/research/questions/generate/:securityId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const asOfDate = (req.query.asOfDate as string | undefined) || req.body.asOfDate;
       const questions = await researchQuestionService.generateQuestionsForSecurity(userId, req.params.securityId, asOfDate);
       res.json(questions);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // List Research Gaps
   app.get('/api/research/gaps', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const securityId = req.query.securityId as string | undefined;
       const status = req.query.status as any;
       const gapType = req.query.gapType as any;
@@ -2871,26 +2938,26 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Create Research Gap
   app.post('/api/research/gaps', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const gap = await researchGapDetectionService.createGap(userId, req.body);
       res.status(201).json(gap);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Get Single Gap
   app.get('/api/research/gaps/:id', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const gap = await researchGapDetectionService.getGap(userId, req.params.id);
       res.json(gap);
     } catch (error: unknown) {
@@ -2901,14 +2968,14 @@ async function startServer() {
       if (errMsg.includes('not found') || errMsg.includes('404')) {
         return res.status(404).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Update Gap Status
   app.patch('/api/research/gaps/:id', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { status, reason, asOfDate } = req.body;
       const updated = await researchGapDetectionService.updateGapStatus(userId, req.params.id, status, reason, asOfDate);
       res.json(updated);
@@ -2917,27 +2984,27 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Detect Gaps for Security
   app.post('/api/research/gaps/detect/:securityId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const asOfDate = (req.query.asOfDate as string | undefined) || req.body.asOfDate;
       const gaps = await researchGapDetectionService.detectGapsForSecurity(userId, req.params.securityId, asOfDate);
       res.json(gaps);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // List Investigation Plans
   app.get('/api/research/plans', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const securityId = req.query.securityId as string | undefined;
       const status = req.query.status as any;
       const asOfDate = req.query.asOfDate as string | undefined;
@@ -2953,26 +3020,26 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Create Investigation Plan
   app.post('/api/research/plans', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const plan = await investigationPlanService.createPlan(userId, req.body);
       res.status(201).json(plan);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Get Single Investigation Plan
   app.get('/api/research/plans/:id', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const plan = await investigationPlanService.getPlan(userId, req.params.id);
       res.json(plan);
     } catch (error: unknown) {
@@ -2983,14 +3050,14 @@ async function startServer() {
       if (errMsg.includes('not found') || errMsg.includes('404')) {
         return res.status(404).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Update Plan Status
   app.patch('/api/research/plans/:id', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { status, reason, asOfDate } = req.body;
       const updated = await investigationPlanService.updatePlanStatus(userId, req.params.id, status, reason, asOfDate);
       res.json(updated);
@@ -2999,14 +3066,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Add Task to Plan
   app.post('/api/research/plans/:id/tasks', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const task = await investigationPlanService.addTask(userId, {
         planId: req.params.id,
         ...req.body
@@ -3017,14 +3084,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Update Task Status
   app.patch('/api/research/plans/:planId/tasks/:taskId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { status, resolutionNotes, attachedEvidenceIds, blockedReason, reason, asOfDate } = req.body;
       const updated = await investigationPlanService.updateTaskStatus(
         userId,
@@ -3045,26 +3112,26 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Add Evidence Requirement
   app.post('/api/research/evidence-requirements', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const reqItem = await investigationPlanService.addEvidenceRequirement(userId, req.body);
       res.status(201).json(reqItem);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Fulfill Evidence Requirement
   app.post('/api/research/plans/:planId/fulfill-requirement', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { requirementId, evidenceIds, reason } = req.body;
       const updated = await investigationPlanService.fulfillEvidenceRequirement(
         userId,
@@ -3076,14 +3143,14 @@ async function startServer() {
       res.json(updated);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Complete Investigation and Record Phase 33 Memory
   app.post('/api/research/investigations/:id/complete', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const result = await investigationPlanService.completeInvestigationAndRecordMemory(
         userId,
         req.params.id,
@@ -3095,14 +3162,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Investigation Overview
   app.get('/api/research/investigations/overview/:securityId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const asOfDate = req.query.asOfDate as string | undefined;
       const overview = await investigationPlanService.generateInvestigationOverview(
         userId,
@@ -3112,20 +3179,20 @@ async function startServer() {
       res.json(overview);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Investigation Audit Trail
   app.get('/api/research/investigations/audit/:targetId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const asOfDate = req.query.asOfDate as string | undefined;
       const audit = await investigationPlanService.getAuditHistory(userId, req.params.targetId, asOfDate);
       res.json(audit);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
@@ -3136,7 +3203,7 @@ async function startServer() {
   // List Evidence Collection Records
   app.get('/api/research/evidence', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const securityId = req.query.securityId as string | undefined;
       const planId = req.query.planId as string | undefined;
       const taskId = req.query.taskId as string | undefined;
@@ -3164,14 +3231,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Collect / Register Evidence
   app.post('/api/research/evidence', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const record = await evidenceCollectionService.collectEvidence(userId, req.body);
       res.status(201).json(record);
     } catch (error: unknown) {
@@ -3179,14 +3246,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Evidence Overview for Security
   app.get('/api/research/evidence/overview/:securityId', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const asOfDate = req.query.asOfDate as string | undefined;
       const overview = await evidenceCollectionService.generateEvidenceOverview(
         userId,
@@ -3196,14 +3263,14 @@ async function startServer() {
       res.json(overview);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Get Single Evidence Record
   app.get('/api/research/evidence/:id', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const record = await evidenceCollectionService.getEvidence(userId, req.params.id);
       res.json(record);
     } catch (error: unknown) {
@@ -3214,14 +3281,14 @@ async function startServer() {
       if (errMsg.includes('not found') || errMsg.includes('404')) {
         return res.status(404).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Validate Evidence
   app.post('/api/research/evidence/:id/validate', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const validated = await evidenceCollectionService.validateEvidence(userId, req.params.id, req.body);
       res.json(validated);
     } catch (error: unknown) {
@@ -3229,14 +3296,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Reject Evidence
   app.post('/api/research/evidence/:id/reject', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const rejected = await evidenceCollectionService.rejectEvidence(userId, req.params.id, req.body);
       res.json(rejected);
     } catch (error: unknown) {
@@ -3244,14 +3311,14 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Supersede Evidence
   app.post('/api/research/evidence/:id/supersede', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const result = await evidenceCollectionService.supersedeEvidence(userId, req.params.id, req.body);
       res.json(result);
     } catch (error: unknown) {
@@ -3259,27 +3326,27 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Evidence Audit Trail
   app.get('/api/research/evidence/:id/audit', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const asOfDate = req.query.asOfDate as string | undefined;
       const audit = await evidenceCollectionService.getEvidenceAuditTrail(userId, req.params.id, asOfDate);
       res.json(audit);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Evidence For Question
   app.get('/api/research/questions/:id/evidence', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const asOfDate = req.query.asOfDate as string | undefined;
       const list = await evidenceCollectionService.getEvidenceList(userId, {
         questionId: req.params.id,
@@ -3288,14 +3355,14 @@ async function startServer() {
       res.json(list);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Evidence For Task
   app.get('/api/research/tasks/:id/evidence', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const asOfDate = req.query.asOfDate as string | undefined;
       const planId = req.query.planId as string | undefined;
       const list = await evidenceCollectionService.getEvidenceList(userId, {
@@ -3306,14 +3373,14 @@ async function startServer() {
       res.json(list);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Evidence For Gap
   app.get('/api/research/gaps/:id/evidence', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const asOfDate = req.query.asOfDate as string | undefined;
       const list = await evidenceCollectionService.getEvidenceList(userId, {
         gapId: req.params.id,
@@ -3322,14 +3389,14 @@ async function startServer() {
       res.json(list);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
   // Reconcile Evidence For Question
   app.post('/api/research/evidence/reconcile', async (req: express.Request, res: express.Response) => {
     try {
-      const userId = (req as any).user?.userId || 'analyst-1';
+      const userId = requireUserId(req);
       const { questionId, asOfDate } = req.body;
       if (!questionId) {
         return res.status(400).json({ error: 'questionId is required for reconciliation.' });
@@ -3345,7 +3412,7 @@ async function startServer() {
       if (errMsg.includes('AuthorizationError') || errMsg.includes('Access denied') || errMsg.includes('403')) {
         return res.status(403).json({ error: errMsg });
       }
-      res.status(400).json({ error: errMsg });
+      res.status(statusForError(error, 400)).json({ error: errMsg });
     }
   });
 
@@ -3364,80 +3431,97 @@ async function startServer() {
     }
   });
 
-  // Historical decisions for a security
+  // Historical decisions for a security (caller's own assessments only)
   app.get('/api/persistence/decisions/:securityId', async (req, res) => {
     try {
       const { securityId } = req.params;
-      const history = await decisionIntelligenceService.getHistoricalDecisions(securityId);
+      const history = await decisionIntelligenceService.getHistoricalDecisionsForOwner(securityId, requireUserId(req));
       res.json({ securityId, history, count: history.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // Historical research snapshots for a security
+  // Historical research snapshots for a security (caller's own snapshots only)
   app.get('/api/persistence/snapshots/:securityId', async (req, res) => {
     try {
       const { securityId } = req.params;
       const resolved = resolveSecurity(securityId);
       const targetId = resolved ? resolved.id : securityId;
-      const snapshots = await persistenceManager.getSnapshotRepository().getBySecurityId(targetId);
+      const snapshots = await persistenceManager.getSnapshotRepository().getBySecurityIdForOwner(targetId, requireUserId(req));
       res.json({ securityId: targetId, snapshots, count: snapshots.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // Persisted research documents
-  app.get('/api/persistence/documents', async (_req, res) => {
+  // Persisted research documents (caller's own documents only)
+  app.get('/api/persistence/documents', async (req, res) => {
     try {
-      const docs = await persistenceManager.getDocumentRepository().getAll();
+      const docs = await persistenceManager.getDocumentRepository().getAllForOwner(requireUserId(req));
       res.json({ documents: docs, count: docs.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // Persisted evidence query
+  // Persisted evidence query (caller's private evidence + explicitly SHARED provider evidence)
   app.get('/api/persistence/evidence', async (req, res) => {
     try {
       const securityId = req.query.securityId as string | undefined;
       const asOfDate = req.query.asOfDate as string | undefined;
-      const items = await persistenceManager.getEvidenceRepository().queryEvidence({ securityId, asOfDate });
+      const items = await persistenceManager.getEvidenceRepository().queryEvidenceForOwner(requireUserId(req), { securityId, asOfDate });
       res.json({ evidence: items, count: items.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
-  // Persisted backtests
-  app.get('/api/persistence/backtests', async (_req, res) => {
+  // Persisted backtests (caller's own results only)
+  app.get('/api/persistence/backtests', async (req, res) => {
     try {
-      const backtests = await persistenceManager.getBacktestRepository().getAll();
+      const backtests = await persistenceManager.getBacktestRepository().getAllForOwner(requireUserId(req));
       res.json({ backtests, count: backtests.length });
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
   // ==========================================
   // PHASE 36: REAL-DATA INTEGRATION & ANALYST PILOT READINESS
+  // Phase 38.2A: the pilot tenant is ALWAYS the authenticated principal. A client-supplied tenantId is never
+  // used as an identity; if one is supplied and differs from the principal the request is rejected (403).
   // ==========================================
+
+  /** Resolves the pilot tenant from the principal; returns null (and responds 403) on a forged tenantId. */
+  const resolvePilotTenant = (req: express.Request, res: express.Response, supplied: unknown): string | null => {
+    const principal = requireUserId(req);
+    if (supplied !== undefined && supplied !== null && supplied !== '' && supplied !== principal) {
+      res.status(403).json({
+        error: 'Forbidden',
+        code: 'TENANT_MISMATCH',
+        message: 'tenantId is derived from the authenticated session and cannot be supplied by the client.'
+      });
+      return null;
+    }
+    return principal;
+  };
 
   // Master Pilot Readiness Scorecard
   app.get('/api/pilot/readiness', async (req, res) => {
     try {
-      const tenantId = (req.query.tenantId as string) || 'analyst_pilot_01';
+      const tenantId = resolvePilotTenant(req, res, req.query.tenantId);
+      if (!tenantId) return;
       const scorecard = await pilotReadinessService.generatePilotReadinessScorecard(tenantId);
       res.json(scorecard);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
@@ -3479,12 +3563,13 @@ async function startServer() {
   app.post('/api/pilot/workflow/:ticker', async (req, res) => {
     try {
       const { ticker } = req.params;
-      const tenantId = (req.body?.tenantId as string) || 'analyst_pilot_01';
+      const tenantId = resolvePilotTenant(req, res, req.body?.tenantId);
+      if (!tenantId) return;
       const result = await pilotReadinessService.executeWorkflowVerification(ticker, tenantId);
       res.json(result);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
@@ -3492,13 +3577,14 @@ async function startServer() {
   app.post('/api/pilot/sec-ingest/:ticker', async (req, res) => {
     try {
       const { ticker } = req.params;
-      const tenantId = (req.body?.tenantId as string) || 'analyst_pilot_01';
+      const tenantId = resolvePilotTenant(req, res, req.body?.tenantId);
+      if (!tenantId) return;
       const maxFilings = parseInt((req.body?.maxFilings as string) || '5', 10);
       const result = await pilotReadinessService.ingestSecFilingsForSecurity(ticker, tenantId, maxFilings);
       res.json(result);
     } catch (error: unknown) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      res.status(500).json({ error: errMsg });
+      res.status(statusForError(error, 500)).json({ error: errMsg });
     }
   });
 
@@ -3507,10 +3593,18 @@ async function startServer() {
   // ==========================================
   app.use('/api', errorHandler);
 
+  return app;
+}
+
+async function startServer() {
+  const PORT = Number(process.env.PORT) || 3000;
+  const app = await createApp();
+
   // ==========================================
   // VITE DEV & PRODUCTION MIDDLEWARE
   // ==========================================
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -3553,4 +3647,7 @@ async function startServer() {
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 }
 
-startServer();
+// Tests import createApp() and set MARKET_THESIS_DISABLE_AUTOSTART=1 so importing this module never binds a port.
+if (process.env.MARKET_THESIS_DISABLE_AUTOSTART !== '1') {
+  startServer();
+}

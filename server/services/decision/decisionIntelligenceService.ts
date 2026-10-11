@@ -18,6 +18,9 @@
  * 5. Provider credential isolation: secrets never leak to response payloads.
  */
 
+import { createHash } from 'crypto';
+import { normalizePrincipalId } from '../../auth/accessPolicy';
+import { visibleToEngine } from '../../auth/engineScope';
 import {
   InvestmentDecisionAssessment,
   SecurityDecisionComparison,
@@ -42,6 +45,33 @@ import { decisionScoringEngine, DecisionScoringInputs } from './decisionScoringE
 import { decisionExplanationEngine } from './decisionExplanationEngine';
 import { DEFAULT_DECISION_CONFIG } from './defaultConfig';
 import { persistenceManager } from '../../persistence/persistenceManager';
+
+/**
+ * Momentum (~6 months), annualized volatility and max drawdown, computed from real daily closes.
+ * Each value is omitted when there are too few bars to compute it honestly.
+ */
+export function computeMarketStats(bars: Array<{ close: number }>): { momentum?: number; volatility?: number; maxDrawdown?: number } {
+  const closes = bars.map(b => b.close).filter(c => Number.isFinite(c) && c > 0);
+  const out: { momentum?: number; volatility?: number; maxDrawdown?: number } = {};
+  if (closes.length >= 127) {
+    out.momentum = Math.round((closes[closes.length - 1] / closes[closes.length - 127] - 1) * 1000) / 10;
+  }
+  if (closes.length >= 22) {
+    const rets: number[] = [];
+    for (let i = 1; i < closes.length; i++) rets.push(Math.log(closes[i] / closes[i - 1]));
+    const mean = rets.reduce((a, r) => a + r, 0) / rets.length;
+    const variance = rets.reduce((a, r) => a + (r - mean) ** 2, 0) / (rets.length - 1);
+    out.volatility = Math.round(Math.sqrt(variance) * Math.sqrt(252) * 1000) / 10;
+    let peak = closes[0];
+    let maxDd = 0;
+    for (const c of closes) {
+      if (c > peak) peak = c;
+      maxDd = Math.max(maxDd, (peak - c) / peak);
+    }
+    out.maxDrawdown = Math.round(maxDd * 1000) / 10;
+  }
+  return out;
+}
 
 export class DecisionIntelligenceService {
   private static instance: DecisionIntelligenceService;
@@ -86,7 +116,14 @@ export class DecisionIntelligenceService {
 
     const asOfDate = request.asOfDate || new Date().toISOString().split('T')[0];
     const config = { ...DEFAULT_DECISION_CONFIG, ...(request.configuration || {}) };
-    const cacheKey = `${security.canonicalId || security.id}:${asOfDate}:${config.version}`;
+    // Phase 38.2A: assessments requested on behalf of an authenticated owner are owner-scoped (cache namespace,
+    // persisted lookup, identity and ownership stamp). Callers without an owner (system/internal) keep the
+    // original deterministic identity and produce ownerless (restricted) records.
+    const owner = normalizePrincipalId(request.ownerUserId);
+    // Phase 38.2D: an ownerless evaluation with a caller-supplied configuration is NOT the canonical shared assessment:
+    // it gets its own cache namespace and is never classified SHARED.
+    const customConfig = !owner && !!request.configuration && Object.keys(request.configuration).length > 0;
+    const cacheKey = `${owner || (customConfig ? `system-custom:${JSON.stringify(request.configuration)}` : 'system')}|${security.canonicalId || security.id}:${asOfDate}:${config.version}`;
 
     if (!request.forceRefresh && this.decisionCache.has(cacheKey)) {
       return this.decisionCache.get(cacheKey)!;
@@ -95,7 +132,10 @@ export class DecisionIntelligenceService {
     // Check persistent repository on cache miss if not forceRefresh
     if (!request.forceRefresh) {
       try {
-        const persisted = await persistenceManager.getDecisionRepository().getLatest(security.id, asOfDate);
+        const persisted = owner
+          ? (await persistenceManager.getDecisionRepository().getHistoryForOwner(security.id, owner))
+              .find(d => d.asOfDate === asOfDate) || null
+          : null;
         if (persisted && persisted.asOfDate === asOfDate) {
           this.decisionCache.set(cacheKey, persisted);
           return persisted;
@@ -106,10 +146,27 @@ export class DecisionIntelligenceService {
     }
 
     // Gather analytical inputs from existing subsystems
-    const inputs = await this.gatherDecisionInputs(security, asOfDate, config);
+    const inputs = await this.gatherDecisionInputs(security, asOfDate, config, owner);
 
     // Run deterministic scoring engine
     let assessment = decisionScoringEngine.evaluate(inputs);
+    if (!owner) {
+      // Phase 38.2D: SHARED only when every input was filtered through the visibility policy with no principal
+      // (evidence, backtests and notebook snapshots are restricted to explicitly SHARED records in gatherDecisionInputs)
+      // AND no caller-supplied configuration was used. Otherwise the assessment stays restricted (ownerless + PRIVATE =>
+      // LEGACY_UNOWNED): fail-closed, never inferred public.
+      assessment = { ...assessment, visibility: customConfig ? 'PRIVATE' : 'SHARED' } as InvestmentDecisionAssessment;
+    }
+    if (owner) {
+      const suffix = createHash('sha256').update(owner).digest('hex').slice(0, 8);
+      assessment = {
+        ...assessment,
+        decisionId: `${assessment.decisionId}-u${suffix}`,
+        ownerUserId: owner,
+        userId: owner,
+        visibility: 'PRIVATE'
+      } as InvestmentDecisionAssessment;
+    }
 
     // Enrich with explanation engine (uses Gemini if accessible, else clean fallback)
     try {
@@ -153,6 +210,13 @@ export class DecisionIntelligenceService {
     return persistenceManager.getDecisionRepository().getHistory(targetId);
   }
 
+  /** Tenant-scoped history (mandatory scope; owner's assessments only). */
+  public async getHistoricalDecisionsForOwner(securityId: string, ownerUserId: string): Promise<InvestmentDecisionAssessment[]> {
+    const resolved = resolveSecurity(securityId);
+    const targetId = resolved ? resolved.id : securityId;
+    return persistenceManager.getDecisionRepository().getHistoryForOwner(targetId, ownerUserId);
+  }
+
   /**
    * Retrieve a cached decision or evaluate on demand.
    */
@@ -161,7 +225,7 @@ export class DecisionIntelligenceService {
     const resolved = resolveSecurity(securityId);
     if (!resolved) return null;
 
-    const cacheKey = `${resolved.id}:${date}:${DEFAULT_DECISION_CONFIG.version}`;
+    const cacheKey = `system|${resolved.id}:${date}:${DEFAULT_DECISION_CONFIG.version}`;
     if (this.decisionCache.has(cacheKey)) {
       return this.decisionCache.get(cacheKey)!;
     }
@@ -176,8 +240,8 @@ export class DecisionIntelligenceService {
     const asOfDate = request.asOfDate || new Date().toISOString().split('T')[0];
     
     const [assessmentA, assessmentB] = await Promise.all([
-      this.evaluateDecision({ securityId: request.securityIdA, asOfDate, configuration: request.configuration }),
-      this.evaluateDecision({ securityId: request.securityIdB, asOfDate, configuration: request.configuration })
+      this.evaluateDecision({ securityId: request.securityIdA, asOfDate, configuration: request.configuration, ownerUserId: request.ownerUserId }),
+      this.evaluateDecision({ securityId: request.securityIdB, asOfDate, configuration: request.configuration, ownerUserId: request.ownerUserId })
     ]);
 
     const dimensions: DecisionDimensionKey[] = [
@@ -289,7 +353,7 @@ export class DecisionIntelligenceService {
     // Evaluate each security as of the common asOfDate
     const assessments = await Promise.all(
       resolvedSecurities.map(sec =>
-        this.evaluateDecision({ securityId: sec.id, asOfDate, configuration })
+        this.evaluateDecision({ securityId: sec.id, asOfDate, configuration, ownerUserId: request.ownerUserId })
       )
     );
 
@@ -332,9 +396,9 @@ export class DecisionIntelligenceService {
         },
         fundamentals: {
           revenue: null,
-          revenueGrowth: fund.revenueTrend === 'GROWING' ? 12.5 : fund.revenueTrend === 'DECLINING' ? -5.0 : 0.0,
+          revenueGrowth: fund.revenueGrowthPct ?? null,
           netIncome: null,
-          operatingMargin: fund.operatingMarginTrend === 'EXPANDING' ? 25.0 : 15.0,
+          operatingMargin: fund.operatingMarginPct ?? null,
           freeCashFlow: null,
           fcfYield: val.priceToFCF ? parseFloat((100 / val.priceToFCF).toFixed(2)) : null,
           roic: null,
@@ -438,15 +502,16 @@ export class DecisionIntelligenceService {
   private async gatherDecisionInputs(
     security: CanonicalSecurity,
     asOfDate: string,
-    config: any
+    config: any,
+    ownerUserId?: string
   ): Promise<DecisionScoringInputs> {
-    // 1. Evidence Query with strict PIT filter
+    // 1. Evidence Query with strict PIT filter, restricted to what the requesting principal may use as an input
+    //    (own records + explicitly SHARED). Ownerless/unclassified legacy and other tenants' evidence never qualify.
     const evidenceQuery: EvidenceQuery = {
       securityId: security.canonicalId,
-      asOfDate,
-      limit: 100
+      asOfDate
     };
-    const evidenceItems = evidenceRepository.query(evidenceQuery);
+    const evidenceItems = evidenceRepository.query(evidenceQuery).filter(e => visibleToEngine(e, ownerUserId)).slice(0, 100);
 
     // 2. Financials from financialDataService
     let financialsInput: DecisionScoringInputs['financials'] = undefined;
@@ -460,28 +525,43 @@ export class DecisionIntelligenceService {
           return effectiveDate <= asOfDate;
         });
 
-        const revFacts = pitFacts.filter(f => f.metric.toLowerCase().includes('revenue') || f.metric.toLowerCase().includes('sales'));
-        const niFacts = pitFacts.filter(f => f.metric.toLowerCase().includes('netincome') || f.metric.toLowerCase().includes('profit'));
-        const opFacts = pitFacts.filter(f => f.metric.toLowerCase().includes('operatingincomeloss'));
+        // Trends are computed from real, point-in-time quarterly figures: the latest discrete quarter against the same
+        // quarter one year earlier (like for like). If a comparison cannot be derived, the trend stays undefined (unknown);
+        // nothing is assumed.
+        const pitQuarters = (finData.historicalQuarters || finData.derivedQuarters || [])
+          .filter(q => q.periodEnd && q.filedDate && q.filedDate <= asOfDate && q.periodEnd <= asOfDate)
+          .sort((x, y) => (x.periodEnd! > y.periodEnd! ? 1 : -1));
+        const latestQ = pitQuarters[pitQuarters.length - 1];
+        const yearAgoQ = latestQ
+          ? pitQuarters.find(q => {
+              const d = (Date.parse(latestQ.periodEnd!) - Date.parse(q.periodEnd!)) / 86400000;
+              return d >= 350 && d <= 380;
+            })
+          : undefined;
 
-        let revenueTrend: 'GROWING' | 'FLAT' | 'DECLINING' = 'GROWING';
-        if (revFacts.length >= 2) {
-          const sorted = [...revFacts].sort((a, b) => (a.periodEnd || '').localeCompare(b.periodEnd || ''));
-          const first = sorted[0].value;
-          const last = sorted[sorted.length - 1].value;
-          if (last > first * 1.05) revenueTrend = 'GROWING';
-          else if (last < first * 0.95) revenueTrend = 'DECLINING';
-          else revenueTrend = 'FLAT';
+        const growthTrend = (cur: number, prev: number): 'GROWING' | 'FLAT' | 'DECLINING' | undefined => {
+          if (!(prev > 0)) return undefined;
+          const ratio = cur / prev;
+          return ratio > 1.02 ? 'GROWING' : ratio < 0.98 ? 'DECLINING' : 'FLAT';
+        };
+
+        let revenueTrend: 'GROWING' | 'FLAT' | 'DECLINING' | undefined;
+        let netIncomeTrend: 'GROWING' | 'FLAT' | 'DECLINING' | undefined;
+        let operatingMarginTrend: 'EXPANDING' | 'STABLE' | 'CONTRACTING' | undefined;
+        let operatingCashFlowTrend: 'POSITIVE' | 'NEUTRAL' | 'NEGATIVE' | undefined;
+        let revenueGrowthPct: number | undefined;
+        let operatingMarginPct: number | undefined;
+        if (latestQ && yearAgoQ && yearAgoQ.revenue > 0 && latestQ.revenue > 0) {
+          revenueTrend = growthTrend(latestQ.revenue, yearAgoQ.revenue);
+          revenueGrowthPct = Math.round((latestQ.revenue / yearAgoQ.revenue - 1) * 1000) / 10;
+          netIncomeTrend = growthTrend(latestQ.netIncome, yearAgoQ.netIncome);
+          const mNow = (latestQ.operatingIncome / latestQ.revenue) * 100;
+          const mPrev = (yearAgoQ.operatingIncome / yearAgoQ.revenue) * 100;
+          operatingMarginPct = Math.round(mNow * 10) / 10;
+          operatingMarginTrend = mNow - mPrev > 1 ? 'EXPANDING' : mNow - mPrev < -1 ? 'CONTRACTING' : 'STABLE';
         }
-
-        let netIncomeTrend: 'GROWING' | 'FLAT' | 'DECLINING' = 'GROWING';
-        if (niFacts.length >= 2) {
-          const sorted = [...niFacts].sort((a, b) => (a.periodEnd || '').localeCompare(b.periodEnd || ''));
-          const first = sorted[0].value;
-          const last = sorted[sorted.length - 1].value;
-          if (last > first * 1.05) netIncomeTrend = 'GROWING';
-          else if (last < first * 0.95) netIncomeTrend = 'DECLINING';
-          else netIncomeTrend = 'FLAT';
+        if (latestQ) {
+          operatingCashFlowTrend = latestQ.operatingCashFlow > 0 ? 'POSITIVE' : latestQ.operatingCashFlow < 0 ? 'NEGATIVE' : 'NEUTRAL';
         }
 
         // Check if real SEC facts exist
@@ -490,12 +570,15 @@ export class DecisionIntelligenceService {
         financialsInput = {
           hasData: pitFacts.length > 0,
           revenueTrend,
-          operatingMarginTrend: 'EXPANDING',
+          operatingMarginTrend,
           netIncomeTrend,
-          operatingCashFlowTrend: 'POSITIVE',
+          operatingCashFlowTrend,
+          revenueGrowthPct,
+          operatingMarginPct,
           periodsCount: pitFacts.length,
-          peRatio: security.ticker === 'NVDA' ? 42.5 : security.ticker === 'MSFT' ? 32.0 : security.ticker === 'RELIANCE' ? 24.5 : null,
-          priceToSales: security.ticker === 'NVDA' ? 22.0 : security.ticker === 'MSFT' ? 12.5 : null,
+          // Valuation multiples need EPS/sales-per-share inputs that are not sourced yet: report unknown, not a guess.
+          peRatio: null,
+          priceToSales: null,
           evidenceIds: pitFacts.slice(0, 5).map((f, i) => `fact-${security.ticker}-${f.metric}-${i}`),
           isRealSecData: isRealSec
         };
@@ -509,10 +592,7 @@ export class DecisionIntelligenceService {
       const filingEv = evidenceItems.filter(e => e.sourceType === 'SEC_EDGAR');
       financialsInput = {
         hasData: true,
-        revenueTrend: 'GROWING',
-        operatingMarginTrend: 'EXPANDING',
-        netIncomeTrend: 'GROWING',
-        operatingCashFlowTrend: 'POSITIVE',
+        // Filing evidence exists but no structured figures: trends are unknown (not assumed favorable).
         periodsCount: filingEv.length,
         peRatio: null,
         evidenceIds: filingEv.map(e => e.evidenceId),
@@ -547,16 +627,15 @@ export class DecisionIntelligenceService {
         }
 
         marketDataInput = {
-          currentPrice: lastBar ? lastBar.close : 100.0,
+          currentPrice: lastBar ? lastBar.close : 0,
           currency: security.currency,
           bars: priceBars,
           provider: hist.provider || 'Twelve Data',
           epistemicStatus: hist.epistemicStatus || 'REAL',
           sma50,
           sma200,
-          momentum: 8.5,
-          volatility: 28.4,
-          maxDrawdown: 18.2
+          // Computed from the real price bars; undefined (unknown) when there are too few bars. Never a constant.
+          ...computeMarketStats(priceBars)
         };
       }
     } catch {
@@ -565,7 +644,7 @@ export class DecisionIntelligenceService {
 
     if (!marketDataInput) {
       marketDataInput = {
-        currentPrice: 100.0,
+        currentPrice: 0,
         currency: security.currency,
         bars: [],
         provider: 'UNAVAILABLE',
@@ -604,29 +683,21 @@ export class DecisionIntelligenceService {
     // 5. Backtest Metrics
     let backtestMetrics: DecisionScoringInputs['backtestMetrics'] = undefined;
     try {
-      const allBacktests = backtestService.getAllBacktests();
+      // Only backtests the principal may use (own or explicitly SHARED); private/legacy results never feed a decision.
+      const allBacktests = backtestService.getAllBacktests().filter(b => visibleToEngine(b, ownerUserId));
       const secTicker = security.symbol || security.ticker || '';
       const match = allBacktests.find(b => (b as any).configuration?.symbol === secTicker || (b as any).symbol === secTicker);
-      if (match) {
+      // Only a real, visible backtest result feeds the decision. No benchmark/default figures are substituted:
+      // without a matching result (or without a Sharpe ratio) the dimension is reported as unavailable.
+      if (match && typeof match.sharpeRatio === 'number' && Number.isFinite(match.sharpeRatio)) {
         backtestMetrics = {
           available: true,
           strategyName: match.strategyTitle || (match as any).configuration?.strategyName || 'Quantitative Strategy',
-          sharpeRatio: match.sharpeRatio ?? 1.25,
-          cagr: match.cagr ?? 16.4,
-          maxDrawdown: match.maxDrawdown ?? 14.8,
-          winRate: match.winRate ?? 58.2,
-          profitFactor: match.profitFactor ?? 1.85
-        };
-      } else {
-        // Provide standard supportive historical simulation reference
-        backtestMetrics = {
-          available: true,
-          strategyName: 'Dual Moving Average Benchmark',
-          sharpeRatio: 1.25,
-          cagr: 16.4,
-          maxDrawdown: 14.8,
-          winRate: 58.2,
-          profitFactor: 1.85
+          sharpeRatio: match.sharpeRatio,
+          cagr: match.cagr ?? null,
+          maxDrawdown: match.maxDrawdown ?? null,
+          winRate: match.winRate ?? null,
+          profitFactor: match.profitFactor ?? null
         };
       }
     } catch {
@@ -646,8 +717,8 @@ export class DecisionIntelligenceService {
           shares: holding.shares || 0,
           marketValue: holding.marketValue || 0,
           unrealizedPnLPct: holding.unrealizedReturnPct || 0,
-          portfolioBetaContribution: holding.beta?.value || 0.15,
-          sectorWeightPct: 22.0
+          portfolioBetaContribution: holding.beta?.value,
+          sectorWeightPct: undefined
         };
       } else {
         portfolioHolding = {
@@ -664,7 +735,7 @@ export class DecisionIntelligenceService {
       const secLookupKey = security.canonicalId || security.id || security.symbol || security.ticker || '';
       const notebook = await researchNotebookService.getOrCreateNotebook(secLookupKey, asOfDate);
       if (notebook && notebook.notebookId) {
-        const latestSnap = researchNotebookService.getLatestSnapshot(notebook.notebookId);
+        const latestSnap = researchNotebookService.getLatestSnapshotVisibleTo(notebook.notebookId, ownerUserId);
         if (latestSnap) {
           const diff = (latestSnap as any).diff || latestSnap.thesis?.whatChanged;
           const thesisImpact = diff?.thesisImpact;

@@ -1,3 +1,4 @@
+import { useAuth } from '../../state/AuthContext';
 import React, { useState, useEffect } from 'react';
 import {
   GitFork,
@@ -45,6 +46,7 @@ export const CounterfactualDecisionView: React.FC<CounterfactualDecisionViewProp
   onSelectStock,
   onOpenEvidence
 }) => {
+  const authUserId = useAuth().user?.userId ?? '';
   const [selectedSecurityId, setSelectedSecurityId] = useState<string>(initialSecurityId || 'us-nvda');
   const [asOfDate, setAsOfDate] = useState<string>('2026-09-20');
   const [targetDimension, setTargetDimension] = useState<DecisionDimensionKey>('valuationContext');
@@ -126,7 +128,7 @@ export const CounterfactualDecisionView: React.FC<CounterfactualDecisionViewProp
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           snapshotId: `snap_cf_${Date.now()}`,
-          userId: 'analyst-1',
+          userId: authUserId, // informational only: the server always stamps the authenticated principal
           title: `${evaluation.ticker} Counterfactual (${evaluation.assumptions.map(a => `${a.parameterKey}=${a.counterfactualValue}`).join(', ')})`,
           securityId: evaluation.securityId,
           asOfDate: evaluation.asOfDate,

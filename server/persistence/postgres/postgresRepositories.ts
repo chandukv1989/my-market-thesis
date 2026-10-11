@@ -5,6 +5,8 @@
  * JSON serialization, and immutable historical artifact protection.
  */
 
+import { requireTenantScope, resolveOwnerId } from '../../auth/accessPolicy';
+import { asOfCutoffDate, isAvailableAsOf } from '../pit';
 import { PostgresClient } from './postgresClient';
 import {
   ISecurityRepository,
@@ -88,6 +90,32 @@ import {
   EvidenceAuditAction,
   EpistemicStatus
 } from '../../../src/types';
+
+/** Phase 38.2A: ownership columns shared by every user-owned relation (see migration 003). */
+function ownerParams(rec: any): [string | null, string] {
+  const owner = resolveOwnerId(rec) || null;
+  const visibility = rec?.visibility === 'SHARED' ? 'SHARED' : 'PRIVATE';
+  return [owner, visibility];
+}
+
+function ownerFields(row: any): { ownerUserId?: string; userId?: string; visibility: 'PRIVATE' | 'SHARED' } {
+  return {
+    ...(row.owner_user_id ? { ownerUserId: row.owner_user_id, userId: row.owner_user_id } : {}),
+    visibility: row.visibility === 'SHARED' ? 'SHARED' : 'PRIVATE'
+  };
+}
+
+/**
+ * Phase 38.2B: the full domain object is persisted in `payload JSONB` so row->domain mapping cannot silently drop or
+ * fabricate fields (several mappers previously substituted constants for fields that were never stored). Columns
+ * stay authoritative for ownership/visibility; the payload is authoritative for everything else.
+ */
+function withPayload<T>(row: any, mapped: T): T {
+  const p = row?.payload;
+  if (!p) return mapped;
+  const obj = typeof p === 'string' ? JSON.parse(p) : p;
+  return { ...mapped, ...obj, ...ownerFields(row) } as T;
+}
 
 // ==========================================
 // 1. SECURITY REPOSITORY
@@ -221,10 +249,14 @@ export class PostgresResearchDocumentRepository implements IResearchDocumentRepo
   }
 
   public async save(doc: ResearchDocument): Promise<{ saved: boolean; isDuplicate: boolean; document: ResearchDocument }> {
-    // Check duplicate by content hash
-    const existing = await this.getByHash(doc.contentHash);
-    if (existing) {
-      return { saved: false, isDuplicate: true, document: existing };
+    // Check duplicate by content hash WITHIN the same owner (Phase 38.2A: never resolve to another tenant's document)
+    const [ownerId, visibility] = ownerParams(doc);
+    const dup = await this.client.query(
+      "SELECT * FROM research_documents WHERE content_hash = $1 AND COALESCE(owner_user_id, '') = COALESCE($2::text, '');",
+      [doc.contentHash, ownerId]
+    );
+    if (dup.rows.length > 0) {
+      return { saved: false, isDuplicate: true, document: this.mapRowToDocument(dup.rows[0]) };
     }
 
     const d = doc as any;
@@ -235,8 +267,9 @@ export class PostgresResearchDocumentRepository implements IResearchDocumentRepo
       INSERT INTO research_documents (
         document_id, filename, document_type, content_hash, title, source, author,
         published_at, available_from, uploaded_at, processing_status,
-        security_associations, metadata, extraction_metadata, page_row_provenance, storage_reference, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW())
+        security_associations, metadata, extraction_metadata, page_row_provenance, storage_reference,
+        owner_user_id, visibility, payload, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19::jsonb, COALESCE($20::timestamptz, NOW()), NOW())
       RETURNING *;
     `;
     const params = [
@@ -255,15 +288,50 @@ export class PostgresResearchDocumentRepository implements IResearchDocumentRepo
       JSON.stringify(doc.metadata || {}),
       JSON.stringify(d.extractionMetadata || {}),
       JSON.stringify(d.pageRowProvenance || []),
-      d.storageReference || null
+      d.storageReference || null,
+      ownerId,
+      visibility,
+      JSON.stringify(d),
+      d.createdAt ?? null
     ];
     const res = await this.client.query(sql, params);
     return { saved: true, isDuplicate: false, document: this.mapRowToDocument(res.rows[0]) };
   }
 
+  public async getAllForOwner(ownerUserId: string, filter?: { securityId?: string; documentType?: string }): Promise<ResearchDocument[]> {
+    const scope = requireTenantScope(ownerUserId);
+    const params: any[] = [scope];
+    let sql = "SELECT * FROM research_documents WHERE (owner_user_id = $1 OR (owner_user_id IS NULL AND visibility = 'SHARED'))";
+    if (filter?.documentType) {
+      params.push(filter.documentType);
+      sql += ` AND document_type = $${params.length}`;
+    }
+    sql += ' ORDER BY uploaded_at DESC;';
+    const res = await this.client.query(sql, params);
+    const docs = res.rows.map(r => this.mapRowToDocument(r));
+    if (filter?.securityId) {
+      return docs.filter(d => (d as any).securityAssociations?.some((s: any) => s.securityId === filter.securityId) || d.securityId === filter.securityId);
+    }
+    return docs;
+  }
+
+  public async deleteForOwner(documentId: string, ownerUserId: string): Promise<boolean> {
+    const scope = requireTenantScope(ownerUserId);
+    const res = await this.client.query('DELETE FROM research_documents WHERE document_id = $1 AND owner_user_id = $2;', [documentId, scope]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
   public async updateStatus(documentId: string, status: DocumentProcessingStatus, metadata?: any): Promise<boolean> {
     const res = await this.client.query(
-      'UPDATE research_documents SET processing_status = $1, metadata = COALESCE($2, metadata), updated_at = NOW() WHERE document_id = $3;',
+      // Merge (not replace) metadata, matching the development adapter; keep the payload in step with the columns.
+      `UPDATE research_documents
+          SET processing_status = $1,
+              metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb),
+              payload = COALESCE(payload, '{}'::jsonb)
+                        || jsonb_build_object('processingStatus', $1::text)
+                        || jsonb_build_object('metadata', COALESCE(metadata, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb)),
+              updated_at = NOW()
+        WHERE document_id = $3;`,
       [status, metadata ? JSON.stringify(metadata) : null, documentId]
     );
     return (res.rowCount ?? 0) > 0;
@@ -275,6 +343,10 @@ export class PostgresResearchDocumentRepository implements IResearchDocumentRepo
   }
 
   private mapRowToDocument(row: any): ResearchDocument {
+    return withPayload(row, this.mapRowToDocumentBase(row));
+  }
+
+  private mapRowToDocumentBase(row: any): ResearchDocument {
     return {
       documentId: row.document_id,
       fileName: row.filename,
@@ -295,7 +367,8 @@ export class PostgresResearchDocumentRepository implements IResearchDocumentRepo
       metadata: typeof row.metadata === 'string' ? JSON.parse(row.metadata) : (row.metadata || {}),
       extractionMetadata: typeof row.extraction_metadata === 'string' ? JSON.parse(row.extraction_metadata) : (row.extraction_metadata || {}),
       pageRowProvenance: typeof row.page_row_provenance === 'string' ? JSON.parse(row.page_row_provenance) : (row.page_row_provenance || []),
-      storageReference: row.storage_reference || undefined
+      storageReference: row.storage_reference || undefined,
+      ...ownerFields(row)
     } as unknown as ResearchDocument;
   }
 }
@@ -320,8 +393,8 @@ export class PostgresEvidenceRepository implements IPersistentEvidenceRepository
         evidence_id, security_id, source_type, provider, document_id, document_type,
         title, content, structured_value, unit, currency, published_at, filing_date,
         period_start, period_end, retrieved_at, epistemic_status, is_simulated,
-        source_reference, metadata, conflict_info, version
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+        source_reference, metadata, conflict_info, version, owner_user_id, visibility, payload, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25::jsonb, COALESCE($26::timestamptz, NOW()))
       ON CONFLICT (evidence_id) DO NOTHING;
     `;
     const params = [
@@ -346,7 +419,10 @@ export class PostgresEvidenceRepository implements IPersistentEvidenceRepository
       JSON.stringify(item.sourceReference || {}),
       JSON.stringify(item.metadata || {}),
       (item as any).conflictInfo ? JSON.stringify((item as any).conflictInfo) : null,
-      (item as any).version || 1
+      (item as any).version || 1,
+      ...ownerParams(item),
+      JSON.stringify(item),
+      (item as any).createdAt ?? null
     ];
 
     const res = await this.client.query(sql, params);
@@ -382,10 +458,12 @@ export class PostgresEvidenceRepository implements IPersistentEvidenceRepository
       sql += ` AND epistemic_status = ANY($${params.length})`;
     }
     if (filter.asOfDate) {
-      const asOfStr = typeof filter.asOfDate === 'string' ? filter.asOfDate : (filter.asOfDate as Date).toISOString();
-      const targetDate = asOfStr.includes('T') ? new Date(asOfStr) : new Date(`${asOfStr}T23:59:59.999Z`);
-      params.push(targetDate);
-      sql += ` AND (published_at IS NULL OR published_at <= $${params.length})`;
+      const targetDate = asOfCutoffDate(filter.asOfDate);
+      if (targetDate) {
+        params.push(targetDate);
+        // Undated evidence has unknown availability => never available as of a date (shared PIT rule).
+        sql += ` AND published_at IS NOT NULL AND published_at <= $${params.length}`;
+      }
     }
     sql += ' ORDER BY published_at DESC NULLS LAST, created_at DESC;';
 
@@ -393,15 +471,47 @@ export class PostgresEvidenceRepository implements IPersistentEvidenceRepository
     return res.rows.map(r => this.mapRowToEvidence(r));
   }
 
+  public async deleteForOwner(evidenceId: string, ownerUserId: string): Promise<boolean> {
+    const scope = requireTenantScope(ownerUserId);
+    const res = await this.client.query('DELETE FROM evidence_items WHERE evidence_id = $1 AND owner_user_id = $2;', [evidenceId, scope]);
+    return (res.rowCount ?? 0) > 0;
+  }
+
+  public async queryEvidenceForOwner(ownerUserId: string, filter: EvidenceFilter): Promise<EvidenceItem[]> {
+    const scope = requireTenantScope(ownerUserId);
+    let sql = "SELECT * FROM evidence_items WHERE (owner_user_id = $1 OR (owner_user_id IS NULL AND visibility = 'SHARED'))";
+    const params: any[] = [scope];
+    if (filter.securityId) {
+      params.push(filter.securityId);
+      sql += ` AND security_id = $${params.length}`;
+    }
+    if (filter.sourceType) {
+      const types = Array.isArray(filter.sourceType) ? filter.sourceType : [filter.sourceType];
+      params.push(types);
+      sql += ` AND source_type = ANY($${params.length})`;
+    }
+    if (filter.epistemicStatus) {
+      const statuses = Array.isArray(filter.epistemicStatus) ? filter.epistemicStatus : [filter.epistemicStatus];
+      params.push(statuses);
+      sql += ` AND epistemic_status = ANY($${params.length})`;
+    }
+    if (filter.asOfDate) {
+      const targetDate = asOfCutoffDate(filter.asOfDate);
+      if (targetDate) {
+        params.push(targetDate);
+        sql += ` AND published_at IS NOT NULL AND published_at <= $${params.length}`;
+      }
+    }
+    sql += ' ORDER BY published_at DESC NULLS LAST, created_at DESC;';
+    const res = await this.client.query(sql, params);
+    return res.rows.map(r => this.mapRowToEvidence(r));
+  }
+
   public async getHistoricalEvidence(evidenceId: string, asOfDate?: string): Promise<EvidenceItem | null> {
     const item = await this.getEvidence(evidenceId);
     if (!item) return null;
-    if (asOfDate && item.publishedAt) {
-      const asOfStr = typeof asOfDate === 'string' ? asOfDate : (asOfDate as any).toISOString();
-      const targetTime = asOfStr.includes('T') ? new Date(asOfStr).getTime() : new Date(`${asOfStr}T23:59:59.999Z`).getTime();
-      if (new Date(item.publishedAt).getTime() > targetTime) {
-        return null; // PIT violation: not available at asOfDate
-      }
+    if (asOfDate && !isAvailableAsOf(item.publishedAt, asOfDate)) {
+      return null; // PIT violation (or unknown availability): not available at asOfDate
     }
     return item;
   }
@@ -424,6 +534,10 @@ export class PostgresEvidenceRepository implements IPersistentEvidenceRepository
   }
 
   private mapRowToEvidence(row: any): EvidenceItem {
+    return withPayload(row, this.mapRowToEvidenceBase(row));
+  }
+
+  private mapRowToEvidenceBase(row: any): EvidenceItem {
     return {
       evidenceId: row.evidence_id,
       securityId: row.security_id || undefined,
@@ -442,7 +556,8 @@ export class PostgresEvidenceRepository implements IPersistentEvidenceRepository
       periodEnd: row.period_end ? new Date(row.period_end).toISOString() : undefined,
       retrievedAt: row.retrieved_at ? new Date(row.retrieved_at).toISOString() : new Date().toISOString(),
       epistemicStatus: row.epistemic_status,
-      isSimulated: Boolean(row.is_simulated)
+      isSimulated: Boolean(row.is_simulated),
+      ...ownerFields(row)
     } as EvidenceItem;
   }
 }
@@ -471,8 +586,8 @@ export class PostgresResearchNotebookRepository implements IResearchNotebookRepo
         notebook_id, security_id, query_context, source_registry, evidence_references,
         claims, thesis, bull_case, bear_case, catalysts, risks, evidence_gaps,
         contradictions, invalidation_conditions, quantitative_context, portfolio_context,
-        snapshot_references, framework_version, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW())
+        snapshot_references, framework_version, owner_user_id, visibility, payload, created_at, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21::jsonb, COALESCE($22::timestamptz, NOW()), NOW())
       ON CONFLICT (notebook_id) DO UPDATE SET
         source_registry = EXCLUDED.source_registry,
         evidence_references = EXCLUDED.evidence_references,
@@ -488,7 +603,9 @@ export class PostgresResearchNotebookRepository implements IResearchNotebookRepo
         quantitative_context = EXCLUDED.quantitative_context,
         portfolio_context = EXCLUDED.portfolio_context,
         snapshot_references = EXCLUDED.snapshot_references,
+        payload = EXCLUDED.payload,
         updated_at = NOW()
+      WHERE COALESCE(research_notebooks.owner_user_id, '') = COALESCE(EXCLUDED.owner_user_id, '')
       RETURNING *;
     `;
     const n = notebook as any;
@@ -514,14 +631,27 @@ export class PostgresResearchNotebookRepository implements IResearchNotebookRepo
       JSON.stringify(n.quantitativeContext || {}),
       JSON.stringify(n.portfolioContext || {}),
       JSON.stringify(n.snapshots || []),
-      n.frameworkVersion || '1.0.0'
+      n.frameworkVersion || '1.0.0',
+      ...ownerParams(n),
+      JSON.stringify(n),
+      n.createdAt ?? null
     ];
     const res = await this.client.query(sql, params);
+    if (res.rows.length === 0) throw new Error(`Notebook "${notebookId}" belongs to a different owner; overwrite refused.`);
     return this.mapRowToNotebook(res.rows[0]);
   }
 
   public async getAll(): Promise<ResearchNotebook[]> {
     const res = await this.client.query('SELECT * FROM research_notebooks ORDER BY updated_at DESC;');
+    return res.rows.map(r => this.mapRowToNotebook(r));
+  }
+
+  public async getAllForOwner(ownerUserId: string): Promise<ResearchNotebook[]> {
+    const scope = requireTenantScope(ownerUserId);
+    const res = await this.client.query(
+      "SELECT * FROM research_notebooks WHERE (owner_user_id = $1 OR (owner_user_id IS NULL AND visibility = 'SHARED')) ORDER BY updated_at DESC;",
+      [scope]
+    );
     return res.rows.map(r => this.mapRowToNotebook(r));
   }
 
@@ -531,6 +661,10 @@ export class PostgresResearchNotebookRepository implements IResearchNotebookRepo
   }
 
   private mapRowToNotebook(row: any): ResearchNotebook {
+    return withPayload(row, this.mapRowToNotebookBase(row));
+  }
+
+  private mapRowToNotebookBase(row: any): ResearchNotebook {
     const parse = (val: any, def: any) => typeof val === 'string' ? JSON.parse(val) : (val || def);
     return {
       notebookId: row.notebook_id,
@@ -558,8 +692,9 @@ export class PostgresResearchNotebookRepository implements IResearchNotebookRepo
         provider: 'POSTGRES',
         asOfDate: new Date().toISOString(),
         retrievedAt: new Date().toISOString()
-      }
-    };
+      },
+      ...ownerFields(row)
+    } as ResearchNotebook;
   }
 }
 
@@ -582,6 +717,15 @@ export class PostgresResearchSnapshotRepository implements IResearchSnapshotRepo
 
   public async getBySecurityId(securityId: string): Promise<ResearchSnapshot[]> {
     const res = await this.client.query('SELECT * FROM research_snapshots WHERE security_id = $1 ORDER BY generated_at ASC;', [securityId]);
+    return res.rows.map(r => this.mapRowToSnapshot(r));
+  }
+
+  public async getBySecurityIdForOwner(securityId: string, ownerUserId: string): Promise<ResearchSnapshot[]> {
+    const scope = requireTenantScope(ownerUserId);
+    const res = await this.client.query(
+      "SELECT * FROM research_snapshots WHERE security_id = $1 AND (owner_user_id = $2 OR (owner_user_id IS NULL AND visibility = 'SHARED')) ORDER BY generated_at ASC;",
+      [securityId, scope]
+    );
     return res.rows.map(r => this.mapRowToSnapshot(r));
   }
 
@@ -615,8 +759,8 @@ export class PostgresResearchSnapshotRepository implements IResearchSnapshotRepo
         framework_version, evidence_ids, claim_ids, thesis, bull_case, bear_case,
         catalysts, risks, what_changed, contradictions, evidence_gaps,
         invalidation_conditions, quantitative_context, portfolio_context,
-        source_coverage, generated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        source_coverage, generated_at, owner_user_id, visibility, payload
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24::jsonb)
       ON CONFLICT (snapshot_id) DO NOTHING
       RETURNING *;
     `;
@@ -641,7 +785,9 @@ export class PostgresResearchSnapshotRepository implements IResearchSnapshotRepo
       JSON.stringify(s.quantitativeContext || s.thesis?.quantitativeContext || {}),
       JSON.stringify(s.portfolioContext || s.thesis?.portfolioContext || {}),
       JSON.stringify(s.sourceCoverage || {}),
-      generatedAt
+      generatedAt,
+      ...ownerParams(s),
+      JSON.stringify(s)
     ];
     const res = await this.client.query(sql, params);
     if (res.rows.length === 0) {
@@ -661,6 +807,10 @@ export class PostgresResearchSnapshotRepository implements IResearchSnapshotRepo
   }
 
   private mapRowToSnapshot(row: any): ResearchSnapshot {
+    return withPayload(row, this.mapRowToSnapshotBase(row));
+  }
+
+  private mapRowToSnapshotBase(row: any): ResearchSnapshot {
     const parse = (val: any, def: any) => typeof val === 'string' ? JSON.parse(val) : (val || def);
     const rawThesis = parse(row.thesis, null);
     const parsedThesis = typeof rawThesis === 'object' && rawThesis !== null ? rawThesis : {
@@ -688,8 +838,9 @@ export class PostgresResearchSnapshotRepository implements IResearchSnapshotRepo
       risks: parse(row.risks, []),
       catalysts: parse(row.catalysts, []),
       conflicts: parse(row.contradictions, []),
-      evidenceGaps: parse(row.evidence_gaps, { available: [], missing: [], unavailable: [] })
-    };
+      evidenceGaps: parse(row.evidence_gaps, { available: [], missing: [], unavailable: [] }),
+      ...ownerFields(row)
+    } as ResearchSnapshot;
   }
 }
 
@@ -726,6 +877,15 @@ export class PostgresDecisionRepository implements IDecisionRepository {
     return res.rows.map(r => this.mapRowToDecision(r));
   }
 
+  public async getHistoryForOwner(securityId: string, ownerUserId: string): Promise<InvestmentDecisionAssessment[]> {
+    const scope = requireTenantScope(ownerUserId);
+    const res = await this.client.query(
+      "SELECT * FROM investment_decisions WHERE security_id = $1 AND (owner_user_id = $2 OR (owner_user_id IS NULL AND visibility = 'SHARED')) ORDER BY as_of_date DESC, generated_at DESC;",
+      [securityId, scope]
+    );
+    return res.rows.map(r => this.mapRowToDecision(r));
+  }
+
   public async save(decision: InvestmentDecisionAssessment): Promise<InvestmentDecisionAssessment> {
     // Decisions are IMMUTABLE: never overwrite an existing historical record
     const existing = await this.get(decision.decisionId);
@@ -742,8 +902,8 @@ export class PostgresDecisionRepository implements IDecisionRepository {
         conviction, dimension_assessments, invalidation_conditions, portfolio_context,
         quant_context, backtest_context, explanation, weights_config, score_inputs,
         data_quality, limitations, is_analytical_only, execution_prohibited,
-        framework_version, generated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        framework_version, generated_at, owner_user_id, visibility, payload
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23::jsonb)
       ON CONFLICT (decision_id) DO NOTHING
       RETURNING *;
     `;
@@ -767,7 +927,9 @@ export class PostgresDecisionRepository implements IDecisionRepository {
       true,
       true,
       d.frameworkVersion || '1.0.0',
-      d.generatedAt ? new Date(d.generatedAt) : new Date()
+      d.generatedAt ? new Date(d.generatedAt) : new Date(),
+      ...ownerParams(d),
+      JSON.stringify(d)
     ];
     const res = await this.client.query(sql, params);
     if (res.rows.length === 0) {
@@ -787,6 +949,10 @@ export class PostgresDecisionRepository implements IDecisionRepository {
   }
 
   private mapRowToDecision(row: any): InvestmentDecisionAssessment {
+    return withPayload(row, this.mapRowToDecisionBase(row));
+  }
+
+  private mapRowToDecisionBase(row: any): InvestmentDecisionAssessment {
     const parse = (val: any, def: any) => typeof val === 'string' ? JSON.parse(val) : (val || def);
     const dims = parse(row.dimension_assessments, {});
     return {
@@ -853,7 +1019,8 @@ export class PostgresDecisionRepository implements IDecisionRepository {
       isAnalyticalOnly: true as const,
       executionProhibited: true as const,
       frameworkVersion: row.framework_version || '1.0.0',
-      generatedAt: row.generated_at ? new Date(row.generated_at).toISOString() : new Date().toISOString()
+      generatedAt: row.generated_at ? new Date(row.generated_at).toISOString() : new Date().toISOString(),
+      ...ownerFields(row)
     } as InvestmentDecisionAssessment;
   }
 }
@@ -875,6 +1042,15 @@ export class PostgresStrategyRepository implements IStrategyRepository {
     return res.rows.map(r => this.mapRowToStrategy(r));
   }
 
+  public async getAllForOwner(ownerUserId: string): Promise<Strategy[]> {
+    const scope = requireTenantScope(ownerUserId);
+    const res = await this.client.query(
+      "SELECT * FROM strategies WHERE (owner_user_id = $1 OR (owner_user_id IS NULL AND visibility = 'SHARED')) ORDER BY name ASC;",
+      [scope]
+    );
+    return res.rows.map(r => this.mapRowToStrategy(r));
+  }
+
   public async save(strategy: Strategy): Promise<Strategy> {
     const s = strategy as any;
     const strategyId = s.id || s.strategyId;
@@ -888,8 +1064,8 @@ export class PostgresStrategyRepository implements IStrategyRepository {
     const sql = `
       INSERT INTO strategies (
         strategy_id, name, description, rules, indicators, position_sizing,
-        risk_constraints, portfolio_construction, parameters, version, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+        risk_constraints, portfolio_construction, parameters, version, owner_user_id, visibility, payload, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, NOW())
       ON CONFLICT (strategy_id) DO UPDATE SET
         name = EXCLUDED.name,
         description = EXCLUDED.description,
@@ -900,7 +1076,9 @@ export class PostgresStrategyRepository implements IStrategyRepository {
         portfolio_construction = EXCLUDED.portfolio_construction,
         parameters = EXCLUDED.parameters,
         version = EXCLUDED.version,
+        payload = EXCLUDED.payload,
         updated_at = NOW()
+      WHERE COALESCE(strategies.owner_user_id, '') = COALESCE(EXCLUDED.owner_user_id, '')
       RETURNING *;
     `;
     const params = [
@@ -913,9 +1091,12 @@ export class PostgresStrategyRepository implements IStrategyRepository {
       JSON.stringify(s.riskConstraints || []),
       JSON.stringify(s.portfolioConstruction || {}),
       JSON.stringify(s.parameters || {}),
-      s.version || '1.0.0'
+      s.version || '1.0.0',
+      ...ownerParams(s),
+      JSON.stringify(s)
     ];
     const res = await this.client.query(sql, params);
+    if (res.rows.length === 0) throw new Error(`Strategy "${strategyId}" belongs to a different owner; overwrite refused.`);
     return this.mapRowToStrategy(res.rows[0]);
   }
 
@@ -925,17 +1106,23 @@ export class PostgresStrategyRepository implements IStrategyRepository {
   }
 
   private mapRowToStrategy(row: any): Strategy {
+    return withPayload(row, this.mapRowToStrategyBase(row));
+  }
+
+  private mapRowToStrategyBase(row: any): Strategy {
     const parse = (val: any, def: any) => typeof val === 'string' ? JSON.parse(val) : (val || def);
     return {
       id: row.strategy_id,
       title: row.name,
       description: row.description || '',
-      prompt: row.prompt || '',
-      status: row.status || 'AI Generated Strategy',
-      targetUniverse: row.target_universe || 'US_EQUITIES',
-      rebalanceFrequency: row.rebalance_frequency || 'DAILY',
+      // These four fields have no dedicated columns; their authoritative values come from `payload` (withPayload).
+      prompt: '',
+      status: 'AI Generated Strategy',
+      targetUniverse: 'US_EQUITIES',
+      rebalanceFrequency: 'DAILY',
       rules: parse(row.rules, []),
-      lastRun: row.updated_at ? new Date(row.updated_at).toISOString() : undefined
+      lastRun: row.updated_at ? new Date(row.updated_at).toISOString() : undefined,
+      ...ownerFields(row)
     } as Strategy;
   }
 }
@@ -959,6 +1146,15 @@ export class PostgresBacktestRepository implements IBacktestRepository {
 
   public async getAll(): Promise<BacktestResult[]> {
     const res = await this.client.query('SELECT * FROM backtests ORDER BY generated_at DESC;');
+    return res.rows.map(r => this.mapRowToBacktest(r));
+  }
+
+  public async getAllForOwner(ownerUserId: string): Promise<BacktestResult[]> {
+    const scope = requireTenantScope(ownerUserId);
+    const res = await this.client.query(
+      "SELECT * FROM backtests WHERE (owner_user_id = $1 OR (owner_user_id IS NULL AND visibility = 'SHARED')) ORDER BY generated_at DESC;",
+      [scope]
+    );
     return res.rows.map(r => this.mapRowToBacktest(r));
   }
 
@@ -989,8 +1185,8 @@ export class PostgresBacktestRepository implements IBacktestRepository {
       INSERT INTO backtests (
         backtest_id, strategy_id, strategy_version, configuration, metrics,
         equity_curve, trades, accounting, benchmark, status, data_fingerprint,
-        is_analytical_only, execution_prohibited, framework_version, generated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        is_analytical_only, execution_prohibited, framework_version, generated_at, owner_user_id, visibility, payload
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb)
       ON CONFLICT (backtest_id) DO NOTHING
       RETURNING *;
     `;
@@ -1009,7 +1205,9 @@ export class PostgresBacktestRepository implements IBacktestRepository {
       b.isAnalyticalOnly ?? true,
       b.executionProhibited ?? true,
       b.frameworkVersion || '1.0.0',
-      b.generatedAt ? new Date(b.generatedAt) : new Date()
+      b.generatedAt ? new Date(b.generatedAt) : new Date(),
+      ...ownerParams(b),
+      JSON.stringify(b)
     ];
     const res = await this.client.query(sql, params);
     if (res.rows.length === 0) {
@@ -1024,6 +1222,10 @@ export class PostgresBacktestRepository implements IBacktestRepository {
   }
 
   private mapRowToBacktest(row: any): BacktestResult {
+    return withPayload(row, this.mapRowToBacktestBase(row));
+  }
+
+  private mapRowToBacktestBase(row: any): BacktestResult {
     const parse = (val: any, def: any) => typeof val === 'string' ? JSON.parse(val) : (val || def);
     const metrics = parse(row.metrics, {});
     const trades = parse(row.trades, []);
@@ -1045,7 +1247,8 @@ export class PostgresBacktestRepository implements IBacktestRepository {
       benchmarkTotalReturn: parse(row.benchmark, {}).totalReturn ?? 0,
       equityCurve: parse(row.equity_curve, []),
       trades: trades,
-      status: row.status
+      status: row.status,
+      ...ownerFields(row)
     } as BacktestResult;
   }
 }
@@ -1065,13 +1268,14 @@ export class PostgresWatchlistRepository implements IWatchlistRepository {
 
   public async saveWatchlist(tickers: string[], id = 'default'): Promise<void> {
     const sql = `
-      INSERT INTO watchlists (watchlist_id, name, security_ids, updated_at)
-      VALUES ($1, 'Default Watchlist', $2, NOW())
+      INSERT INTO watchlists (watchlist_id, name, security_ids, owner_user_id, updated_at)
+      VALUES ($1, 'Default Watchlist', $2, $3, NOW())
       ON CONFLICT (watchlist_id) DO UPDATE SET
         security_ids = EXCLUDED.security_ids,
         updated_at = NOW();
     `;
-    await this.client.query(sql, [id, JSON.stringify(tickers)]);
+    // The watchlist id is the tenant key for per-user lists; the shared 'default' list stays unowned (legacy/restricted).
+    await this.client.query(sql, [id, JSON.stringify(tickers), id === 'default' ? null : id]);
   }
 
   public async addTicker(ticker: string, id = 'default'): Promise<void> {
@@ -1110,10 +1314,12 @@ export class PostgresAlertRepository implements IAlertRepository {
     const a = alert as any;
     const message = a.message || a.whatChanged || '';
     const sql = `
-      INSERT INTO alerts (alert_id, security_id, ticker, type, severity, title, message, timestamp, is_read)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      INSERT INTO alerts (alert_id, security_id, ticker, type, severity, title, message, timestamp, is_read, owner_user_id, visibility, payload)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb)
       ON CONFLICT (alert_id) DO UPDATE SET
-        is_read = EXCLUDED.is_read
+        is_read = EXCLUDED.is_read,
+        payload = EXCLUDED.payload
+      WHERE COALESCE(alerts.owner_user_id, '') = COALESCE(EXCLUDED.owner_user_id, '')
       RETURNING *;
     `;
     const params = [
@@ -1125,10 +1331,22 @@ export class PostgresAlertRepository implements IAlertRepository {
       alert.title,
       message,
       alert.timestamp,
-      alert.read ?? alert.isRead ?? false
+      alert.read ?? alert.isRead ?? false,
+      ...ownerParams(a),
+      JSON.stringify(a)
     ];
     const res = await this.client.query(sql, params);
+    if (res.rows.length === 0) throw new Error(`Alert "${alert.id}" belongs to a different owner; overwrite refused.`);
     return this.mapRowToAlert(res.rows[0]);
+  }
+
+  public async getAllForOwner(ownerUserId: string): Promise<AlertItem[]> {
+    const scope = requireTenantScope(ownerUserId);
+    const res = await this.client.query(
+      "SELECT * FROM alerts WHERE (owner_user_id = $1 OR (owner_user_id IS NULL AND visibility = 'SHARED')) ORDER BY timestamp DESC;",
+      [scope]
+    );
+    return res.rows.map(r => this.mapRowToAlert(r));
   }
 
   public async saveMany(alerts: AlertItem[]): Promise<number> {
@@ -1143,7 +1361,7 @@ export class PostgresAlertRepository implements IAlertRepository {
   public async update(alertId: string, updates: Partial<AlertItem>): Promise<boolean> {
     if (updates.read !== undefined || (updates as any).isRead !== undefined) {
       const readVal = updates.read ?? (updates as any).isRead;
-      const res = await this.client.query('UPDATE alerts SET is_read = $1 WHERE alert_id = $2;', [readVal, alertId]);
+      const res = await this.client.query("UPDATE alerts SET is_read = $1, payload = COALESCE(payload, '{}'::jsonb) || jsonb_build_object('read', $1::boolean, 'isRead', $1::boolean) WHERE alert_id = $2;", [readVal, alertId]);
       return (res.rowCount ?? 0) > 0;
     }
     return false;
@@ -1155,6 +1373,10 @@ export class PostgresAlertRepository implements IAlertRepository {
   }
 
   private mapRowToAlert(row: any): AlertItem {
+    return withPayload(row, this.mapRowToAlertBase(row));
+  }
+
+  private mapRowToAlertBase(row: any): AlertItem {
     return {
       id: row.alert_id,
       ticker: row.ticker,
@@ -1167,8 +1389,9 @@ export class PostgresAlertRepository implements IAlertRepository {
       timestamp: row.timestamp,
       read: Boolean(row.is_read),
       isRead: Boolean(row.is_read),
-      provenanceType: 'FACT'
-    };
+      provenanceType: 'FACT',
+      ...ownerFields(row)
+    } as AlertItem;
   }
 }
 
@@ -1192,8 +1415,8 @@ export class PostgresPortfolioRepository implements IPortfolioRepository {
       await client.query('DELETE FROM portfolio_positions WHERE portfolio_id = $1;', [portfolioId]);
       for (const pos of positions) {
         await client.query(
-          'INSERT INTO portfolio_positions (portfolio_id, ticker, shares, avg_cost, updated_at) VALUES ($1, $2, $3, $4, NOW());',
-          [portfolioId, pos.ticker, pos.shares, pos.avgCost]
+          'INSERT INTO portfolio_positions (portfolio_id, ticker, shares, avg_cost, owner_user_id, updated_at) VALUES ($1, $2, $3, $4, $5, NOW());',
+          [portfolioId, pos.ticker, pos.shares, pos.avgCost, portfolioId === 'default' ? null : portfolioId]
         );
       }
     });
@@ -1201,14 +1424,14 @@ export class PostgresPortfolioRepository implements IPortfolioRepository {
 
   public async updatePosition(ticker: string, shares: number, avgCost: number, portfolioId = 'default'): Promise<void> {
     const sql = `
-      INSERT INTO portfolio_positions (portfolio_id, ticker, shares, avg_cost, updated_at)
-      VALUES ($1, $2, $3, $4, NOW())
+      INSERT INTO portfolio_positions (portfolio_id, ticker, shares, avg_cost, owner_user_id, updated_at)
+      VALUES ($1, $2, $3, $4, $5, NOW())
       ON CONFLICT (portfolio_id, ticker) DO UPDATE SET
         shares = EXCLUDED.shares,
         avg_cost = EXCLUDED.avg_cost,
         updated_at = NOW();
     `;
-    await this.client.query(sql, [portfolioId, ticker, shares, avgCost]);
+    await this.client.query(sql, [portfolioId, ticker, shares, avgCost, portfolioId === 'default' ? null : portfolioId]);
   }
 }
 
@@ -1229,6 +1452,15 @@ export class PostgresResearchQueryRepository implements IResearchQueryRepository
     return res.rows.map(r => this.mapRowToQuery(r));
   }
 
+  public async getAllForOwner(ownerUserId: string): Promise<ResearchQueryItem[]> {
+    const scope = requireTenantScope(ownerUserId);
+    const res = await this.client.query(
+      "SELECT * FROM research_queries WHERE (owner_user_id = $1 OR (owner_user_id IS NULL AND visibility = 'SHARED')) ORDER BY created_at DESC;",
+      [scope]
+    );
+    return res.rows.map(r => this.mapRowToQuery(r));
+  }
+
   public async save(query: ResearchQueryItem): Promise<ResearchQueryItem> {
     const q = query as any;
     const queryId = q.id || q.queryId;
@@ -1241,8 +1473,8 @@ export class PostgresResearchQueryRepository implements IResearchQueryRepository
     const sql = `
       INSERT INTO research_queries (
         query_id, query, intent, security_context, as_of_date, retrieval_metadata,
-        evidence_references, generated_answer, framework_version, created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+        evidence_references, generated_answer, framework_version, owner_user_id, visibility, payload, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, COALESCE($13::timestamptz, NOW()))
       ON CONFLICT (query_id) DO NOTHING
       RETURNING *;
     `;
@@ -1255,7 +1487,10 @@ export class PostgresResearchQueryRepository implements IResearchQueryRepository
       JSON.stringify(q.retrievalMetadata || {}),
       JSON.stringify(groundedFacts),
       answerSummary,
-      q.frameworkVersion || '1.0.0'
+      q.frameworkVersion || '1.0.0',
+      ...ownerParams(q),
+      JSON.stringify(q),
+      q.date ?? null
     ];
     const res = await this.client.query(sql, params);
     if (res.rows.length === 0) {
@@ -1270,6 +1505,10 @@ export class PostgresResearchQueryRepository implements IResearchQueryRepository
   }
 
   private mapRowToQuery(row: any): ResearchQueryItem {
+    return withPayload(row, this.mapRowToQueryBase(row));
+  }
+
+  private mapRowToQueryBase(row: any): ResearchQueryItem {
     const parse = (val: any, def: any) => typeof val === 'string' ? JSON.parse(val) : (val || def);
     return {
       id: row.query_id,
@@ -1621,7 +1860,8 @@ export class PostgresInvestmentMonitorRepository implements IInvestmentMonitorRe
         portfolio_exposure = EXCLUDED.portfolio_exposure,
         last_change_summary = EXCLUDED.last_change_summary,
         epistemic_status = EXCLUDED.epistemic_status,
-        updated_at = EXCLUDED.updated_at;
+        updated_at = EXCLUDED.updated_at
+      WHERE investment_monitors.owner_user_id = EXCLUDED.owner_user_id;
     `;
     const params = [
       monitor.monitorId,
@@ -1653,7 +1893,8 @@ export class PostgresInvestmentMonitorRepository implements IInvestmentMonitorRe
       monitor.createdAt || new Date().toISOString(),
       monitor.updatedAt || new Date().toISOString()
     ];
-    await this.client.query(sql, params);
+    const res = await this.client.query(sql, params);
+    if ((res.rowCount ?? 1) === 0) throw new Error(`Monitor "${monitor.monitorId}" belongs to a different owner; overwrite refused.`);
     return monitor;
   }
 
@@ -1682,8 +1923,8 @@ export class PostgresInvestmentMonitorRepository implements IInvestmentMonitorRe
   public async addNote(monitorId: string, note: AnalystReviewNote): Promise<AnalystReviewNote> {
     const sql = `
       INSERT INTO monitor_notes (
-        note_id, monitor_id, review_id, user_id, author_name, created_at, content, label, is_immutable
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'USER NOTE', true)
+        note_id, monitor_id, review_id, user_id, owner_user_id, author_name, created_at, content, label, is_immutable
+      ) VALUES ($1, $2, $3, $4, $4, $5, $6, $7, 'USER NOTE', true)
       ON CONFLICT (note_id) DO NOTHING;
     `;
     await this.client.query(sql, [
@@ -1920,7 +2161,8 @@ export class PostgresMonitoringPolicyRepository implements IMonitoringPolicyRepo
         configuration = EXCLUDED.configuration,
         min_severity = EXCLUDED.min_severity,
         cooldown_minutes = EXCLUDED.cooldown_minutes,
-        updated_at = EXCLUDED.updated_at;
+        updated_at = EXCLUDED.updated_at
+      WHERE monitoring_policies.owner_user_id = EXCLUDED.owner_user_id;
     `;
     const params = [
       policy.policyId,
@@ -1940,7 +2182,8 @@ export class PostgresMonitoringPolicyRepository implements IMonitoringPolicyRepo
       policy.createdAt || new Date().toISOString(),
       policy.updatedAt || new Date().toISOString()
     ];
-    await this.client.query(sql, params);
+    const res = await this.client.query(sql, params);
+    if ((res.rowCount ?? 1) === 0) throw new Error(`Policy "${policy.policyId}" belongs to a different owner; overwrite refused.`);
     return policy;
   }
 
@@ -2084,7 +2327,8 @@ export class PostgresAlertOrchestrationRepository implements IAlertOrchestration
         resolved_at = EXCLUDED.resolved_at,
         dismissed_at = EXCLUDED.dismissed_at,
         contextual_analysis = EXCLUDED.contextual_analysis,
-        audit_trail = EXCLUDED.audit_trail;
+        audit_trail = EXCLUDED.audit_trail
+      WHERE orchestrated_alerts.owner_user_id = EXCLUDED.owner_user_id;
     `;
     const params = [
       alert.alertId,
@@ -2117,7 +2361,8 @@ export class PostgresAlertOrchestrationRepository implements IAlertOrchestration
       JSON.stringify(alert.reviewReference || {}),
       JSON.stringify(alert.auditTrail || [])
     ];
-    await this.client.query(sql, params);
+    const res = await this.client.query(sql, params);
+    if ((res.rowCount ?? 1) === 0) throw new Error(`Orchestrated alert "${alert.alertId}" belongs to a different owner; overwrite refused.`);
     return alert;
   }
 
@@ -2181,793 +2426,8 @@ export class PostgresAlertOrchestrationRepository implements IAlertOrchestration
 }
 
 // ==========================================
-// 19. RESEARCH PRIORITY REPOSITORY
+// 19-31. SQL-BACKED PAYLOAD REPOSITORIES (Phase 38.2B)
+// Research priorities, cross-investment/scenario/counterfactual snapshots, research memory/questions/gaps,
+// investigation plans/audits and evidence collections/relationships/audits were in-memory `Map` caches.
 // ==========================================
-export class PostgresResearchPriorityRepository implements IResearchPriorityRepository {
-  private cache: Map<string, ResearchPrioritySnapshot> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async getSnapshot(snapshotId: string): Promise<ResearchPrioritySnapshot | null> {
-    if (this.cache.has(snapshotId)) {
-      return JSON.parse(JSON.stringify(this.cache.get(snapshotId)!));
-    }
-    return null;
-  }
-
-  public async getLatestSnapshot(userId: string, universeType?: string): Promise<ResearchPrioritySnapshot | null> {
-    const snaps = Array.from(this.cache.values()).filter(s => {
-      if (s.userId !== userId) return false;
-      if (universeType && universeType !== 'ALL' && s.universeType !== universeType) return false;
-      return true;
-    });
-    if (snaps.length === 0) return null;
-    snaps.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return JSON.parse(JSON.stringify(snaps[0]));
-  }
-
-  public async getSnapshotsByUserId(userId: string): Promise<ResearchPrioritySnapshot[]> {
-    const snaps = Array.from(this.cache.values()).filter(s => s.userId === userId);
-    snaps.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return JSON.parse(JSON.stringify(snaps));
-  }
-
-  public async saveSnapshot(snapshot: ResearchPrioritySnapshot): Promise<ResearchPrioritySnapshot> {
-    const cloned = JSON.parse(JSON.stringify(snapshot));
-    this.cache.set(snapshot.snapshotId, cloned);
-    return cloned;
-  }
-
-  public async getAll(): Promise<ResearchPrioritySnapshot[]> {
-    return Array.from(this.cache.values()).map(s => JSON.parse(JSON.stringify(s)));
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-// ==========================================
-// 20. CROSS-INVESTMENT SNAPSHOT REPOSITORY (PHASE 30)
-// ==========================================
-export class PostgresCrossInvestmentSnapshotRepository implements ICrossInvestmentSnapshotRepository {
-  private cache: Map<string, CrossInvestmentSnapshot> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async getSnapshot(snapshotId: string): Promise<CrossInvestmentSnapshot | null> {
-    if (this.cache.has(snapshotId)) {
-      return JSON.parse(JSON.stringify(this.cache.get(snapshotId)!));
-    }
-    return null;
-  }
-
-  public async getSnapshotsByUserId(userId: string): Promise<CrossInvestmentSnapshot[]> {
-    const snaps = Array.from(this.cache.values()).filter(s => s.userId === userId);
-    snaps.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return JSON.parse(JSON.stringify(snaps));
-  }
-
-  public async saveSnapshot(snapshot: CrossInvestmentSnapshot): Promise<CrossInvestmentSnapshot> {
-    if (this.cache.has(snapshot.snapshotId)) {
-      throw new Error(`Snapshot with ID "${snapshot.snapshotId}" already exists. Historical relationship snapshots are strictly immutable.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(snapshot));
-    this.cache.set(snapshot.snapshotId, cloned);
-    return cloned;
-  }
-
-  public async getAll(): Promise<CrossInvestmentSnapshot[]> {
-    return Array.from(this.cache.values()).map(s => JSON.parse(JSON.stringify(s)));
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-// ==========================================
-// 21. PORTFOLIO SCENARIO REPOSITORY (PHASE 31)
-// ==========================================
-export class PostgresPortfolioScenarioRepository implements IPortfolioScenarioRepository {
-  private cache: Map<string, PortfolioScenarioSnapshot> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async getSnapshot(snapshotId: string): Promise<PortfolioScenarioSnapshot | null> {
-    if (this.cache.has(snapshotId)) {
-      return JSON.parse(JSON.stringify(this.cache.get(snapshotId)!));
-    }
-    return null;
-  }
-
-  public async getSnapshotsByUserId(userId: string): Promise<PortfolioScenarioSnapshot[]> {
-    const snaps = Array.from(this.cache.values()).filter(s => s.userId === userId);
-    snaps.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return JSON.parse(JSON.stringify(snaps));
-  }
-
-  public async saveSnapshot(snapshot: PortfolioScenarioSnapshot): Promise<PortfolioScenarioSnapshot> {
-    if (this.cache.has(snapshot.snapshotId)) {
-      throw new Error(`Scenario snapshot with ID "${snapshot.snapshotId}" already exists. Historical scenario snapshots are strictly immutable.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(snapshot));
-    this.cache.set(snapshot.snapshotId, cloned);
-    return cloned;
-  }
-
-  public async getAll(): Promise<PortfolioScenarioSnapshot[]> {
-    return Array.from(this.cache.values()).map(s => JSON.parse(JSON.stringify(s)));
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-// ==========================================
-// 22. COUNTERFACTUAL REPOSITORY (PHASE 32)
-// ==========================================
-export class PostgresCounterfactualRepository implements ICounterfactualRepository {
-  private cache: Map<string, CounterfactualSnapshot> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async getSnapshot(snapshotId: string): Promise<CounterfactualSnapshot | null> {
-    if (this.cache.has(snapshotId)) {
-      return JSON.parse(JSON.stringify(this.cache.get(snapshotId)!));
-    }
-    return null;
-  }
-
-  public async getSnapshotsByUserId(userId: string): Promise<CounterfactualSnapshot[]> {
-    const snaps = Array.from(this.cache.values()).filter(s => s.userId === userId);
-    snaps.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return JSON.parse(JSON.stringify(snaps));
-  }
-
-  public async saveSnapshot(snapshot: CounterfactualSnapshot): Promise<CounterfactualSnapshot> {
-    if (this.cache.has(snapshot.snapshotId)) {
-      throw new Error(`Counterfactual snapshot with ID "${snapshot.snapshotId}" already exists. Historical counterfactual snapshots are strictly immutable.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(snapshot));
-    this.cache.set(snapshot.snapshotId, cloned);
-    return cloned;
-  }
-
-  public async getAll(): Promise<CounterfactualSnapshot[]> {
-    return Array.from(this.cache.values()).map(s => JSON.parse(JSON.stringify(s)));
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-export class PostgresResearchMemoryRepository implements IResearchMemoryRepository {
-  private cache: Map<string, ResearchMemoryEntry> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async get(id: string): Promise<ResearchMemoryEntry | null> {
-    if (this.cache.has(id)) {
-      return JSON.parse(JSON.stringify(this.cache.get(id)!));
-    }
-    return null;
-  }
-
-  public async getAll(filter?: {
-    securityId?: string;
-    userId?: string;
-    asOfDate?: string;
-    memoryType?: ResearchMemoryType;
-    status?: ResearchMemoryStatus;
-  }): Promise<ResearchMemoryEntry[]> {
-    let list = Array.from(this.cache.values());
-
-    if (filter?.securityId) {
-      const target = filter.securityId.toLowerCase();
-      list = list.filter(m =>
-        m.securityId.toLowerCase() === target ||
-        m.ticker.toLowerCase() === target ||
-        m.securityId.toLowerCase().includes(target)
-      );
-    }
-
-    if (filter?.userId) {
-      list = list.filter(m => m.userId === filter.userId);
-    }
-
-    if (filter?.asOfDate) {
-      list = list.filter(m => m.asOfDate <= filter.asOfDate!);
-    }
-
-    if (filter?.memoryType) {
-      list = list.filter(m => m.memoryType === filter.memoryType);
-    }
-
-    if (filter?.status) {
-      list = list.filter(m => m.status === filter.status);
-    }
-
-    list.sort((a, b) => {
-      if (b.asOfDate !== a.asOfDate) {
-        return b.asOfDate.localeCompare(a.asOfDate);
-      }
-      if (b.createdAt !== a.createdAt) {
-        return b.createdAt.localeCompare(a.createdAt);
-      }
-      return b.id.localeCompare(a.id);
-    });
-
-    return JSON.parse(JSON.stringify(list));
-  }
-
-  public async save(entry: ResearchMemoryEntry): Promise<ResearchMemoryEntry> {
-    if (this.cache.has(entry.id)) {
-      throw new Error(`Research memory with ID "${entry.id}" already exists. Historical research memories are strictly immutable.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(entry));
-    this.cache.set(entry.id, cloned);
-    return cloned;
-  }
-
-  public async update(entry: ResearchMemoryEntry): Promise<ResearchMemoryEntry> {
-    if (!this.cache.has(entry.id)) {
-      throw new Error(`Research memory with ID "${entry.id}" not found.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(entry));
-    this.cache.set(entry.id, cloned);
-    return cloned;
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-export class PostgresResearchQuestionRepository implements IResearchQuestionRepository {
-  private cache: Map<string, ResearchQuestionEntry> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async get(id: string): Promise<ResearchQuestionEntry | null> {
-    if (this.cache.has(id)) {
-      return JSON.parse(JSON.stringify(this.cache.get(id)!));
-    }
-    return null;
-  }
-
-  public async getAll(filter?: {
-    securityId?: string;
-    userId?: string;
-    status?: ResearchQuestionStatus;
-    asOfDate?: string;
-  }): Promise<ResearchQuestionEntry[]> {
-    let list = Array.from(this.cache.values());
-
-    if (filter?.securityId) {
-      const target = filter.securityId.toLowerCase();
-      list = list.filter(q =>
-        q.securityId.toLowerCase() === target ||
-        q.ticker.toLowerCase() === target ||
-        q.securityId.toLowerCase().includes(target)
-      );
-    }
-
-    if (filter?.userId) {
-      list = list.filter(q => q.userId === filter.userId);
-    }
-
-    if (filter?.status) {
-      list = list.filter(q => q.status === filter.status);
-    }
-
-    if (filter?.asOfDate) {
-      list = list.filter(q => q.asOfDate <= filter.asOfDate!);
-    }
-
-    list.sort((a, b) => {
-      if (b.updatedAt !== a.updatedAt) {
-        return b.updatedAt.localeCompare(a.updatedAt);
-      }
-      if (b.createdAt !== a.createdAt) {
-        return b.createdAt.localeCompare(a.createdAt);
-      }
-      return b.id.localeCompare(a.id);
-    });
-
-    return JSON.parse(JSON.stringify(list));
-  }
-
-  public async save(question: ResearchQuestionEntry): Promise<ResearchQuestionEntry> {
-    const cloned = JSON.parse(JSON.stringify(question));
-    this.cache.set(question.id, cloned);
-    return cloned;
-  }
-
-  public async update(question: ResearchQuestionEntry): Promise<ResearchQuestionEntry> {
-    if (!this.cache.has(question.id)) {
-      throw new Error(`Research question with ID "${question.id}" not found.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(question));
-    this.cache.set(question.id, cloned);
-    return cloned;
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-export class PostgresResearchGapRepository implements IResearchGapRepository {
-  private cache: Map<string, ResearchGapRecord> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async get(id: string): Promise<ResearchGapRecord | null> {
-    if (this.cache.has(id)) {
-      return JSON.parse(JSON.stringify(this.cache.get(id)!));
-    }
-    return null;
-  }
-
-  public async getAll(filter?: {
-    securityId?: string;
-    userId?: string;
-    status?: ResearchGapStatus;
-    asOfDate?: string;
-    gapType?: ResearchGapType;
-  }): Promise<ResearchGapRecord[]> {
-    let list = Array.from(this.cache.values());
-
-    if (filter?.securityId) {
-      const target = filter.securityId.toLowerCase();
-      list = list.filter(g =>
-        g.securityId.toLowerCase() === target ||
-        g.ticker.toLowerCase() === target ||
-        g.securityId.toLowerCase().includes(target)
-      );
-    }
-
-    if (filter?.userId) {
-      list = list.filter(g => g.userId === filter.userId || g.tenantId === filter.userId);
-    }
-
-    if (filter?.status) {
-      list = list.filter(g => g.status === filter.status);
-    }
-
-    if (filter?.gapType) {
-      list = list.filter(g => g.gapType === filter.gapType);
-    }
-
-    if (filter?.asOfDate) {
-      list = list.filter(g => g.asOfDate <= filter.asOfDate!);
-    }
-
-    list.sort((a, b) => {
-      if (b.asOfDate !== a.asOfDate) {
-        return b.asOfDate.localeCompare(a.asOfDate);
-      }
-      if (b.createdAt !== a.createdAt) {
-        return b.createdAt.localeCompare(a.createdAt);
-      }
-      return b.gapId.localeCompare(a.gapId);
-    });
-
-    return JSON.parse(JSON.stringify(list));
-  }
-
-  public async save(gap: ResearchGapRecord): Promise<ResearchGapRecord> {
-    if (this.cache.has(gap.gapId)) {
-      throw new Error(`Research gap with ID "${gap.gapId}" already exists. Overwrite prohibited.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(gap));
-    this.cache.set(gap.gapId, cloned);
-    return cloned;
-  }
-
-  public async update(gap: ResearchGapRecord): Promise<ResearchGapRecord> {
-    if (!this.cache.has(gap.gapId)) {
-      throw new Error(`Research gap with ID "${gap.gapId}" not found.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(gap));
-    this.cache.set(gap.gapId, cloned);
-    return cloned;
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-export class PostgresInvestigationPlanRepository implements IInvestigationPlanRepository {
-  private cache: Map<string, InvestigationPlan> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async get(id: string): Promise<InvestigationPlan | null> {
-    if (this.cache.has(id)) {
-      return JSON.parse(JSON.stringify(this.cache.get(id)!));
-    }
-    return null;
-  }
-
-  public async getAll(filter?: {
-    securityId?: string;
-    userId?: string;
-    status?: InvestigationPlanStatus;
-    asOfDate?: string;
-  }): Promise<InvestigationPlan[]> {
-    let list = Array.from(this.cache.values());
-
-    if (filter?.securityId) {
-      const target = filter.securityId.toLowerCase();
-      list = list.filter(p =>
-        p.securityId.toLowerCase() === target ||
-        p.ticker.toLowerCase() === target ||
-        p.securityId.toLowerCase().includes(target)
-      );
-    }
-
-    if (filter?.userId) {
-      list = list.filter(p => p.userId === filter.userId || p.tenantId === filter.userId);
-    }
-
-    if (filter?.status) {
-      list = list.filter(p => p.status === filter.status);
-    }
-
-    if (filter?.asOfDate) {
-      list = list.filter(p => p.asOfDate <= filter.asOfDate!);
-    }
-
-    list.sort((a, b) => {
-      if (b.asOfDate !== a.asOfDate) {
-        return b.asOfDate.localeCompare(a.asOfDate);
-      }
-      if (b.createdAt !== a.createdAt) {
-        return b.createdAt.localeCompare(a.createdAt);
-      }
-      return b.planId.localeCompare(a.planId);
-    });
-
-    return JSON.parse(JSON.stringify(list));
-  }
-
-  public async save(plan: InvestigationPlan): Promise<InvestigationPlan> {
-    if (this.cache.has(plan.planId)) {
-      throw new Error(`Investigation plan with ID "${plan.planId}" already exists. Overwrite prohibited.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(plan));
-    this.cache.set(plan.planId, cloned);
-    return cloned;
-  }
-
-  public async update(plan: InvestigationPlan): Promise<InvestigationPlan> {
-    if (!this.cache.has(plan.planId)) {
-      throw new Error(`Investigation plan with ID "${plan.planId}" not found.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(plan));
-    this.cache.set(plan.planId, cloned);
-    return cloned;
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-export class PostgresInvestigationAuditRepository implements IInvestigationAuditRepository {
-  private cache: Map<string, InvestigationAuditRecord> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async get(id: string): Promise<InvestigationAuditRecord | null> {
-    if (this.cache.has(id)) {
-      return JSON.parse(JSON.stringify(this.cache.get(id)!));
-    }
-    return null;
-  }
-
-  public async getAll(filter?: {
-    targetId?: string;
-    tenantId?: string;
-    targetType?: string;
-    asOfDate?: string;
-  }): Promise<InvestigationAuditRecord[]> {
-    let list = Array.from(this.cache.values());
-
-    if (filter?.targetId) {
-      list = list.filter(a => a.targetId === filter.targetId);
-    }
-
-    if (filter?.tenantId) {
-      list = list.filter(a => a.tenantId === filter.tenantId);
-    }
-
-    if (filter?.targetType) {
-      list = list.filter(a => a.targetType === filter.targetType);
-    }
-
-    if (filter?.asOfDate) {
-      list = list.filter(a => a.asOfDate <= filter.asOfDate!);
-    }
-
-    list.sort((a, b) => {
-      if (b.timestamp !== a.timestamp) {
-        return b.timestamp.localeCompare(a.timestamp);
-      }
-      return b.auditId.localeCompare(a.auditId);
-    });
-
-    return JSON.parse(JSON.stringify(list));
-  }
-
-  public async save(audit: InvestigationAuditRecord): Promise<InvestigationAuditRecord> {
-    if (this.cache.has(audit.auditId)) {
-      throw new Error(`Investigation audit record with ID "${audit.auditId}" already exists. Append-only enforced.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(audit));
-    this.cache.set(audit.auditId, cloned);
-    return cloned;
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-export class PostgresEvidenceCollectionRepository implements IEvidenceCollectionRepository {
-  private cache: Map<string, EvidenceCollectionRecord> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async get(id: string): Promise<EvidenceCollectionRecord | null> {
-    if (this.cache.has(id)) {
-      return JSON.parse(JSON.stringify(this.cache.get(id)!));
-    }
-    return null;
-  }
-
-  public async getBySourceFingerprint(fingerprint: string, tenantId?: string): Promise<EvidenceCollectionRecord | null> {
-    const all = Array.from(this.cache.values());
-    const match = all.find(r =>
-      r.sourceFingerprint === fingerprint &&
-      (!tenantId || r.tenantId === tenantId || r.userId === tenantId) &&
-      r.collectionStatus !== 'SUPERSEDED'
-    );
-    return match ? JSON.parse(JSON.stringify(match)) : null;
-  }
-
-  public async getAll(filter?: {
-    securityId?: string;
-    userId?: string;
-    tenantId?: string;
-    planId?: string;
-    taskId?: string;
-    questionId?: string;
-    gapId?: string;
-    status?: CollectionStatus;
-    sourceType?: EvidenceSourceClass;
-    epistemicStatus?: EpistemicStatus;
-    asOfDate?: string;
-  }): Promise<EvidenceCollectionRecord[]> {
-    let list = Array.from(this.cache.values());
-
-    if (filter?.securityId) {
-      const target = filter.securityId.toLowerCase();
-      list = list.filter(r =>
-        r.securityId.toLowerCase() === target ||
-        r.ticker.toLowerCase() === target ||
-        r.securityId.toLowerCase().includes(target)
-      );
-    }
-
-    const effectiveTenant = filter?.tenantId || filter?.userId;
-    if (effectiveTenant) {
-      list = list.filter(r => r.tenantId === effectiveTenant || r.userId === effectiveTenant);
-    }
-
-    if (filter?.planId) {
-      list = list.filter(r => r.planId === filter.planId);
-    }
-
-    if (filter?.taskId) {
-      list = list.filter(r => r.taskId === filter.taskId);
-    }
-
-    if (filter?.questionId) {
-      list = list.filter(r => r.questionId === filter.questionId);
-    }
-
-    if (filter?.gapId) {
-      list = list.filter(r => r.gapId === filter.gapId);
-    }
-
-    if (filter?.status) {
-      list = list.filter(r => r.collectionStatus === filter.status);
-    }
-
-    if (filter?.sourceType) {
-      list = list.filter(r => r.sourceType === filter.sourceType);
-    }
-
-    if (filter?.epistemicStatus) {
-      list = list.filter(r => r.epistemicStatus === filter.epistemicStatus);
-    }
-
-    if (filter?.asOfDate) {
-      list = list.filter(r => r.asOfDate <= filter.asOfDate! && r.availableAt <= filter.asOfDate!);
-    }
-
-    const statusPriority: Record<CollectionStatus, number> = {
-      VALIDATED: 0,
-      COLLECTED: 1,
-      AVAILABLE: 2,
-      REQUESTED: 3,
-      DISCOVERED: 4,
-      CONFLICTING: 5,
-      STALE: 6,
-      UNAVAILABLE: 7,
-      REJECTED: 8,
-      SUPERSEDED: 9
-    };
-
-    list.sort((a, b) => {
-      const prioA = statusPriority[a.collectionStatus] ?? 99;
-      const prioB = statusPriority[b.collectionStatus] ?? 99;
-      if (prioA !== prioB) return prioA - prioB;
-      if (b.asOfDate !== a.asOfDate) return b.asOfDate.localeCompare(a.asOfDate);
-      if (b.collectedAt !== a.collectedAt) return b.collectedAt.localeCompare(a.collectedAt);
-      return a.collectionId.localeCompare(b.collectionId);
-    });
-
-    return JSON.parse(JSON.stringify(list));
-  }
-
-  public async save(record: EvidenceCollectionRecord): Promise<EvidenceCollectionRecord> {
-    if (this.cache.has(record.collectionId)) {
-      throw new Error(`Evidence collection record with ID "${record.collectionId}" already exists. Overwrite prohibited.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(record));
-    this.cache.set(record.collectionId, cloned);
-    return cloned;
-  }
-
-  public async update(record: EvidenceCollectionRecord): Promise<EvidenceCollectionRecord> {
-    if (!this.cache.has(record.collectionId)) {
-      throw new Error(`Evidence collection record with ID "${record.collectionId}" not found.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(record));
-    this.cache.set(record.collectionId, cloned);
-    return cloned;
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-export class PostgresEvidenceRelationshipRepository implements IEvidenceRelationshipRepository {
-  private cache: Map<string, EvidenceResearchRelationship> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async get(id: string): Promise<EvidenceResearchRelationship | null> {
-    if (this.cache.has(id)) {
-      return JSON.parse(JSON.stringify(this.cache.get(id)!));
-    }
-    return null;
-  }
-
-  public async getAll(filter?: {
-    sourceId?: string;
-    targetId?: string;
-    targetType?: string;
-    relationshipType?: EvidenceRelationshipType;
-    tenantId?: string;
-    asOfDate?: string;
-  }): Promise<EvidenceResearchRelationship[]> {
-    let list = Array.from(this.cache.values());
-
-    if (filter?.sourceId) {
-      list = list.filter(r => r.sourceId === filter.sourceId);
-    }
-    if (filter?.targetId) {
-      list = list.filter(r => r.targetId === filter.targetId);
-    }
-    if (filter?.targetType) {
-      list = list.filter(r => r.targetType === filter.targetType);
-    }
-    if (filter?.relationshipType) {
-      list = list.filter(r => r.relationshipType === filter.relationshipType);
-    }
-    if (filter?.tenantId) {
-      list = list.filter(r => r.tenantId === filter.tenantId);
-    }
-    if (filter?.asOfDate) {
-      list = list.filter(r => r.asOfDate <= filter.asOfDate!);
-    }
-
-    list.sort((a, b) => {
-      if (b.asOfDate !== a.asOfDate) return b.asOfDate.localeCompare(a.asOfDate);
-      if (b.createdAt !== a.createdAt) return b.createdAt.localeCompare(a.createdAt);
-      return a.relationshipId.localeCompare(b.relationshipId);
-    });
-
-    return JSON.parse(JSON.stringify(list));
-  }
-
-  public async save(rel: EvidenceResearchRelationship): Promise<EvidenceResearchRelationship> {
-    const cloned = JSON.parse(JSON.stringify(rel));
-    this.cache.set(rel.relationshipId, cloned);
-    return cloned;
-  }
-
-  public async delete(relationshipId: string): Promise<boolean> {
-    return this.cache.delete(relationshipId);
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
-
-export class PostgresEvidenceAuditRepository implements IEvidenceAuditRepository {
-  private cache: Map<string, EvidenceAuditRecord> = new Map();
-
-  constructor(private client: PostgresClient) {}
-
-  public async get(id: string): Promise<EvidenceAuditRecord | null> {
-    if (this.cache.has(id)) {
-      return JSON.parse(JSON.stringify(this.cache.get(id)!));
-    }
-    return null;
-  }
-
-  public async getAll(filter?: {
-    collectionId?: string;
-    tenantId?: string;
-    action?: EvidenceAuditAction;
-    asOfDate?: string;
-  }): Promise<EvidenceAuditRecord[]> {
-    let list = Array.from(this.cache.values());
-
-    if (filter?.collectionId) {
-      list = list.filter(a => a.collectionId === filter.collectionId);
-    }
-    if (filter?.tenantId) {
-      list = list.filter(a => a.tenantId === filter.tenantId);
-    }
-    if (filter?.action) {
-      list = list.filter(a => a.action === filter.action);
-    }
-    if (filter?.asOfDate) {
-      list = list.filter(a => a.asOfDate <= filter.asOfDate!);
-    }
-
-    list.sort((a, b) => {
-      if (b.timestamp !== a.timestamp) {
-        return b.timestamp.localeCompare(a.timestamp);
-      }
-      return b.auditId.localeCompare(a.auditId);
-    });
-
-    return JSON.parse(JSON.stringify(list));
-  }
-
-  public async save(audit: EvidenceAuditRecord): Promise<EvidenceAuditRecord> {
-    if (this.cache.has(audit.auditId)) {
-      throw new Error(`Evidence audit record with ID "${audit.auditId}" already exists. Append-only enforced.`);
-    }
-    const cloned = JSON.parse(JSON.stringify(audit));
-    this.cache.set(audit.auditId, cloned);
-    return cloned;
-  }
-
-  public async count(): Promise<number> {
-    return this.cache.size;
-  }
-}
+export * from './postgresPayloadRepositories';

@@ -12,12 +12,31 @@ import {
   IEvidenceRepository
 } from '../../../src/types';
 import { persistenceManager } from '../../persistence/persistenceManager';
+import { asOfCutoffMs, isAvailableAsOf } from '../../persistence/pit';
+import { createHash } from 'crypto';
+import { canRead, isSharedRecord, requireTenantScope, resolveOwnerId } from '../../auth/accessPolicy';
 
 /**
  * Generate a deterministic fingerprint for exact deduplication.
  * Identical security, source, concept/document, period, and value are deduplicated.
  */
+/**
+ * Phase 38.2E: access domain of a record. Records only deduplicate, conflict-compare or overwrite WITHIN one domain:
+ *   owner:<id>   private to that tenant
+ *   shared       explicitly classified SHARED
+ *   restricted   ownerless + unclassified (legacy) or explicitly restricted — never merged with `shared`
+ * (Previously ownerless legacy records and SHARED records both mapped to 'shared', which let a fresh provider fetch
+ * collide with — and promote — a legacy record.)
+ */
+export function accessDomain(item: { ownerUserId?: string; userId?: string; tenantId?: string; visibility?: string }): string {
+  const owner = resolveOwnerId(item as any);
+  if (owner) return `owner:${owner}`;
+  return isSharedRecord(item as any) ? 'shared' : 'restricted';
+}
+
 export function generateEvidenceFingerprint(item: EvidenceItem): string {
+  // Phase 38.2A/E: identical values in different access domains must never dedupe into one record.
+  const domain = accessDomain(item);
   const sec = (item.securityId || 'global').trim().toLowerCase();
   const source = (item.sourceType || 'unknown').trim().toLowerCase();
   const prov = (item.provider || 'unknown').trim().toLowerCase();
@@ -27,7 +46,7 @@ export function generateEvidenceFingerprint(item: EvidenceItem): string {
     ? JSON.stringify(item.structuredValue)
     : String(item.structuredValue ?? item.content ?? '').trim();
 
-  return `${sec}::${source}::${prov}::${doc}::${period}::${val}`;
+  return `${domain}::${sec}::${source}::${prov}::${doc}::${period}::${val}`;
 }
 
 /**
@@ -61,7 +80,26 @@ export class EvidenceRepository implements IEvidenceRepository {
     // 2. Exact Deduplication Check
     const fingerprint = generateEvidenceFingerprint(item);
     if (this.itemsByFingerprint.has(fingerprint)) {
+      // Phase 38.2E: an exact match inside the SAME access domain is a plain duplicate. Matching content is never proof
+      // of ownership, visibility or sharing permission, so an existing record is NEVER reclassified or otherwise
+      // modified by a later fetch (the fingerprint embeds the access domain, so a SHARED fetch cannot match a legacy
+      // record in the first place).
       return false; // Identical evidence already exists, skip
+    }
+
+    // Phase 38.2E: never overwrite a record that lives in a different access domain (legacy/restricted, another tenant,
+    // or shared) just because the deterministic evidence id is the same. The newcomer is stored under a domain-derived
+    // revision id; the existing record (and its id) stay untouched.
+    const clash = this.itemsById.get(item.evidenceId);
+    if (clash && accessDomain(clash) !== accessDomain(item)) {
+      const requested = item.evidenceId;
+      const tag = createHash('sha256').update(accessDomain(item)).digest('hex').slice(0, 8);
+      let candidate = `${requested}~${tag}`;
+      for (let rev = 2; this.itemsById.has(candidate) && accessDomain(this.itemsById.get(candidate)!) !== accessDomain(item); rev++) {
+        candidate = `${requested}~${tag}-r${rev}`;
+      }
+      item.evidenceId = candidate;
+      item.metadata = { ...(item.metadata || {}), requestedEvidenceId: requested };
     }
 
     // 3. Conflict Detection
@@ -70,7 +108,9 @@ export class EvidenceRepository implements IEvidenceRepository {
 
     for (const existingId of existingIdsWithSameConcept) {
       const existing = this.itemsById.get(existingId);
-      if (existing) {
+      // Phase 38.2A: conflicts are only flagged within one access domain (same owner, or both shared) so a
+      // private value can never be written into conflictDetails of an item another tenant can read.
+      if (existing && accessDomain(existing) === accessDomain(item)) {
         // If different providers report differing values for the same concept/period, flag conflict
         const isDifferentProvider = existing.provider.toLowerCase() !== item.provider.toLowerCase();
         const isDifferentValue = String(existing.structuredValue) !== String(item.structuredValue) &&
@@ -171,15 +211,13 @@ export class EvidenceRepository implements IEvidenceRepository {
    * Excludes any evidence not yet published by asOfDate.
    */
   public getEvidenceAvailableAsOf(asOfDate: string | Date, filter?: EvidenceFilter): EvidenceItem[] {
-    const asOfTime = new Date(asOfDate).getTime();
-    if (isNaN(asOfTime)) {
+    if (asOfCutoffMs(asOfDate) === null) {
       return [];
     }
 
     return Array.from(this.itemsById.values()).filter(item => {
-      // 1. Point-in-time check: publishedAt must be <= asOfDate
-      const pubTime = new Date(item.publishedAt).getTime();
-      if (isNaN(pubTime) || pubTime > asOfTime) {
+      // 1. Point-in-time check (shared rule): publishedAt must be known and <= asOfDate (date-only = end of day)
+      if (!isAvailableAsOf(item.publishedAt, asOfDate)) {
         return false;
       }
 
@@ -190,6 +228,22 @@ export class EvidenceRepository implements IEvidenceRepository {
 
       return true;
     });
+  }
+
+  /**
+   * Tenant-scoped reads (Phase 38.2A). The scope is mandatory: owner's private items + explicitly SHARED items.
+   */
+  public getEvidenceAvailableAsOfForOwner(ownerUserId: string, asOfDate: string | Date, filter?: EvidenceFilter): EvidenceItem[] {
+    const scope = requireTenantScope(ownerUserId);
+    return this.getEvidenceAvailableAsOf(asOfDate, filter).filter(i => canRead(i, scope));
+  }
+
+  public queryEvidenceForOwner(ownerUserId: string, filter: EvidenceFilter): EvidenceItem[] {
+    const scope = requireTenantScope(ownerUserId);
+    const { limit, ...rest } = filter || ({} as EvidenceFilter);
+    let results = this.queryEvidence(rest as EvidenceFilter).filter(i => canRead(i, scope));
+    if (typeof limit === 'number' && limit > 0) results = results.slice(0, limit);
+    return results;
   }
 
   /**
@@ -313,14 +367,9 @@ export class EvidenceRepository implements IEvidenceRepository {
         const end = new Date(filter.endDate).getTime();
         if (!isNaN(end) && pubTime > end) return false;
       }
-      if (filter.asOfDate) {
-        const asOfStr = typeof filter.asOfDate === 'string' ? filter.asOfDate : filter.asOfDate.toISOString();
-        const asOf = asOfStr.includes('T')
-          ? new Date(asOfStr).getTime()
-          : new Date(`${asOfStr}T23:59:59.999Z`).getTime();
-        if (!isNaN(asOf) && pubTime > asOf) return false;
-      }
     }
+    // Shared PIT rule: undated evidence has unknown availability and is excluded from any asOfDate query.
+    if (filter.asOfDate && !isAvailableAsOf(item.publishedAt, filter.asOfDate)) return false;
 
     return true;
   }

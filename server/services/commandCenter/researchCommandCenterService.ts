@@ -15,6 +15,7 @@
  *   - Gemini summarization non-interference (structured state remains 100% deterministic).
  */
 
+import { latestDecisionVisibleTo, latestSnapshotVisibleTo, visibleToEngine } from '../../auth/engineScope';
 import { GoogleGenAI } from '@google/genai';
 import {
   CommandCenterViewData,
@@ -414,7 +415,7 @@ export class ResearchCommandCenterService {
       let scoreDelta: number | undefined;
 
       try {
-        const dec = await decisionRepo.getLatest(sec.id, new Date(asOfTimestamp).toISOString());
+        const dec = await latestDecisionVisibleTo(userId, sec.id, new Date(asOfTimestamp).toISOString());
         if (dec) {
           decisionRating = dec.overallAssessment || (dec as any).rating;
           scoreDelta = dec.compositeScore;
@@ -552,17 +553,14 @@ export class ResearchCommandCenterService {
     const snapshotRepo = persistenceManager.getSnapshotRepository();
 
     const allNotebooks = await notebookRepo.getAll();
-    const userNotebooks = allNotebooks.filter(nb => {
-      const owner = (nb as any).ownerUserId || (nb as any).userId;
-      return !owner || owner === userId;
-    });
+    const userNotebooks = allNotebooks.filter(nb => visibleToEngine(nb, userId));
 
     const notebookBySec = new Map<string, any>();
     userNotebooks.forEach(nb => {
       if (nb.securityId) notebookBySec.set(nb.securityId, nb);
     });
 
-    const allSnapshots = await snapshotRepo.getAll();
+    const allSnapshots = (await snapshotRepo.getAll()).filter(s => visibleToEngine(s, userId));
     const pitSnapshots = allSnapshots.filter(s => {
       const snapTime = new Date(s.createdAt || (s as any).researchAsOfDate).getTime();
       return snapTime <= asOfTimestamp;

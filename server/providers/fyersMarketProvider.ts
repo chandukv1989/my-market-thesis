@@ -477,6 +477,10 @@ export class FYERSMarketProvider implements RegionalMarketProvider {
 
         const v = item.v;
         const lastPrice = parseFloat(v.lp ?? v.cmd?.c ?? v.close_price ?? 0);
+        // Positive finite price validation: reject zero, negative, NaN, or Infinity as REAL
+        if (!Number.isFinite(lastPrice) || lastPrice <= 0) {
+          continue; // Skip invalid price observations; never promote bad data to REAL
+        }
         const change = parseFloat(v.ch ?? (lastPrice - (v.prev_close_price || lastPrice)));
         const changePercent = parseFloat(v.chp ?? (v.prev_close_price ? (change / v.prev_close_price) * 100 : 0));
         const rawVol = parseInt(v.volume ?? v.cmd?.v ?? 0, 10);
@@ -701,7 +705,14 @@ export class FYERSMarketProvider implements RegionalMarketProvider {
             epistemicStatus: 'REAL' as const
           };
         })
-        .filter((b: HistoricalPriceBar) => !isNaN(b.close) && b.close > 0)
+        .filter((b: HistoricalPriceBar) => {
+          return !isNaN(b.open) && b.open > 0 &&
+                 !isNaN(b.high) && b.high > 0 &&
+                 !isNaN(b.low) && b.low > 0 &&
+                 !isNaN(b.close) && b.close > 0 &&
+                 b.high >= b.open && b.high >= b.close && b.high >= b.low &&
+                 b.low <= b.open && b.low <= b.close && b.low <= b.high;
+        })
         .sort((a: HistoricalPriceBar, b: HistoricalPriceBar) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
       const response: HistoricalPricesResponse = {

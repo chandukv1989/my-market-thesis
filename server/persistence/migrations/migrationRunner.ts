@@ -10,9 +10,11 @@ import { MIGRATIONS, Migration } from './schema';
 
 export class MigrationRunner {
   private pool: Pool;
+  private migrations: Migration[];
 
-  constructor(pool: Pool) {
+  constructor(pool: Pool, migrations: Migration[] = MIGRATIONS) {
     this.pool = pool;
+    this.migrations = migrations;
   }
 
   /**
@@ -37,7 +39,7 @@ export class MigrationRunner {
       let appliedCount = 0;
 
       // 3. Apply pending migrations sequentially in a transaction
-      for (const migration of MIGRATIONS) {
+      for (const migration of this.migrations) {
         if (!appliedVersions.has(migration.version)) {
           await client.query('BEGIN');
           try {

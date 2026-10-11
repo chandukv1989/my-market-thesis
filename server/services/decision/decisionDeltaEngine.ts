@@ -11,6 +11,7 @@
  * 4. Analytical only; zero broker execution.
  */
 
+import { canRead } from '../../auth/accessPolicy';
 import {
   InvestmentDecisionAssessment,
   DecisionDelta,
@@ -43,7 +44,7 @@ export class DecisionDeltaEngine {
    * Retrieves the chronological historical decision milestones for a security.
    * Records are retrieved strictly from persistence without regeneration.
    */
-  public async getTimeline(securityId: string): Promise<DecisionTimelineResponse> {
+  public async getTimeline(securityId: string, ownerUserId?: string): Promise<DecisionTimelineResponse> {
     const resolved = resolveSecurity(securityId);
     if (!resolved) {
       throw new Error(`Unknown or non-canonical security ID: ${securityId}`);
@@ -52,9 +53,13 @@ export class DecisionDeltaEngine {
     const decisionRepo = persistenceManager.getDecisionRepository();
     
     // Query history by security ID and symbol
-    const historyA = await decisionRepo.getHistory(resolved.id);
+    // Phase 38.2A: when an owner scope is supplied (all HTTP callers) only that owner's assessments are read.
+    const readHistory = (id: string) => ownerUserId
+      ? decisionRepo.getHistoryForOwner(id, ownerUserId)
+      : decisionRepo.getHistory(id);
+    const historyA = await readHistory(resolved.id);
     const historyB = resolved.id !== resolved.symbol
-      ? await decisionRepo.getHistory(resolved.symbol)
+      ? await readHistory(resolved.symbol)
       : [];
 
     // Combine and deduplicate by decisionId
@@ -306,13 +311,19 @@ export class DecisionDeltaEngine {
   public async getDeltaBetweenDecisions(
     securityId: string,
     fromDecisionId: string,
-    toDecisionId: string
+    toDecisionId: string,
+    ownerUserId?: string
   ): Promise<DecisionDelta> {
     const decisionRepo = persistenceManager.getDecisionRepository();
-    const [decBefore, decAfter] = await Promise.all([
+    const [rawBefore, rawAfter] = await Promise.all([
       decisionRepo.get(fromDecisionId),
       decisionRepo.get(toDecisionId)
     ]);
+    // Phase 38.2A: with an owner scope, a decision the caller does not own is indistinguishable from a missing one.
+    const visible = (d: InvestmentDecisionAssessment | null) =>
+      d && (!ownerUserId || canRead(d as any, ownerUserId)) ? d : null;
+    const decBefore = visible(rawBefore);
+    const decAfter = visible(rawAfter);
 
     if (!decBefore) {
       throw new Error(`Historical decision assessment not found for ID: ${fromDecisionId}`);
@@ -327,8 +338,8 @@ export class DecisionDeltaEngine {
   /**
    * Computes the deterministic delta between a decision and its chronologically previous decision.
    */
-  public async getAdjacentDelta(securityId: string, toDecisionId: string): Promise<DecisionDelta | null> {
-    const timeline = await this.getTimeline(securityId);
+  public async getAdjacentDelta(securityId: string, toDecisionId: string, ownerUserId?: string): Promise<DecisionDelta | null> {
+    const timeline = await this.getTimeline(securityId, ownerUserId);
     const milestones = timeline.milestones;
     const targetIdx = milestones.findIndex(m => m.decisionId === toDecisionId);
 
@@ -341,7 +352,7 @@ export class DecisionDeltaEngine {
     }
 
     const prevMilestone = milestones[targetIdx - 1];
-    return this.getDeltaBetweenDecisions(securityId, prevMilestone.decisionId, toDecisionId);
+    return this.getDeltaBetweenDecisions(securityId, prevMilestone.decisionId, toDecisionId, ownerUserId);
   }
 }
 

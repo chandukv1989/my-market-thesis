@@ -43,6 +43,27 @@ export interface ClientFinancialsResponse {
     period: string;
     fiscalYear?: number | string;
     fiscalPeriod?: string;
+    periodEnd?: string;
+    revenue: number;
+    grossProfit: number;
+    grossMarginPct: number;
+    operatingIncome: number;
+    netIncome: number;
+    operatingCashFlow: number;
+    capex: number;
+    freeCashFlow: number;
+    form: string;
+    filedDate: string;
+    accessionNumber: string;
+    sourceUrl: string;
+    isSimulated: boolean;
+  }[];
+  /** Longer quarterly history (up to 12) used for like-for-like year-over-year comparisons. */
+  historicalQuarters?: {
+    period: string;
+    fiscalYear?: number | string;
+    fiscalPeriod?: string;
+    periodEnd?: string;
     revenue: number;
     grossProfit: number;
     grossMarginPct: number;

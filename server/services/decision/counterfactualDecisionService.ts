@@ -21,6 +21,7 @@
  *   Gemini has ZERO authority over structured math or decision classifications.
  */
 
+import { canRead } from '../../auth/accessPolicy';
 import { GoogleGenAI } from '@google/genai';
 import {
   CanonicalSecurity,
@@ -111,24 +112,28 @@ export class CounterfactualDecisionService {
 
     if (request.decisionId) {
       const found = await decisionRepo.get(request.decisionId);
-      if (found) {
+      // Phase 38.2A: a decision the caller may not read is treated exactly like a missing one (no disclosure).
+      if (found && canRead(found as any, userId)) {
         baseDecision = found;
       } else {
         baseDecision = await decisionIntelligenceService.evaluateDecision({
           securityId: resolved.id,
           asOfDate,
-          forceRefresh: request.forceRefresh
+          forceRefresh: request.forceRefresh,
+          ownerUserId: userId
         });
       }
     } else {
-      const persisted = await decisionRepo.getLatest(resolved.id, asOfDate);
+      const ownHistory = await decisionRepo.getHistoryForOwner(resolved.id, userId);
+      const persisted = ownHistory.find(d => d.asOfDate <= asOfDate) || null;
       if (persisted && persisted.asOfDate === asOfDate && !request.forceRefresh) {
         baseDecision = persisted;
       } else {
         baseDecision = await decisionIntelligenceService.evaluateDecision({
           securityId: resolved.id,
           asOfDate,
-          forceRefresh: request.forceRefresh
+          forceRefresh: request.forceRefresh,
+          ownerUserId: userId
         });
       }
     }
@@ -1010,7 +1015,7 @@ Provide a concise 2-sentence institutional synthesis and 1-sentence thesis impli
   /**
    * Returns pre-computed sensitivity boundaries for an asset.
    */
-  public async getSensitivity(securityId: string, asOfDate?: string): Promise<{
+  public async getSensitivity(securityId: string, asOfDate?: string, ownerUserId?: string): Promise<{
     securityId: string;
     ticker: string;
     asOfDate: string;
@@ -1023,7 +1028,8 @@ Provide a concise 2-sentence institutional synthesis and 1-sentence thesis impli
     const effectiveDate = asOfDate || new Date().toISOString().split('T')[0];
     const decision = await decisionIntelligenceService.evaluateDecision({
       securityId: resolved.id,
-      asOfDate: effectiveDate
+      asOfDate: effectiveDate,
+      ownerUserId
     });
 
     const boundaries = this.calculateSensitivityBoundaries(resolved, decision);
@@ -1038,9 +1044,11 @@ Provide a concise 2-sentence institutional synthesis and 1-sentence thesis impli
   /**
    * Returns traceability graph for an existing decision.
    */
-  public async getTraceability(decisionId: string): Promise<CounterfactualTraceabilityGraph> {
+  public async getTraceability(decisionId: string, ownerUserId?: string): Promise<CounterfactualTraceabilityGraph> {
     const decisionRepo = persistenceManager.getDecisionRepository();
-    const decision = await decisionRepo.get(decisionId);
+    const found = await decisionRepo.get(decisionId);
+    // Phase 38.2A: with an owner scope, an unreadable decision is indistinguishable from a missing one.
+    const decision = found && (!ownerUserId || canRead(found as any, ownerUserId)) ? found : null;
     if (!decision) {
       throw new Error(`Decision with ID '${decisionId}' not found.`);
     }

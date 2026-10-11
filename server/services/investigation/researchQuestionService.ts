@@ -18,6 +18,7 @@
  * - Native USD vs INR currency isolation.
  */
 
+import { latestDecisionVisibleTo, latestSnapshotVisibleTo, visibleToEngine } from '../../auth/engineScope';
 import {
   ResearchQuestionEntry,
   ResearchQuestionStatus,
@@ -361,7 +362,7 @@ export class ResearchQuestionService {
     // 3. Decision-Drift Questions
     try {
       const decRepo = persistenceManager.getDecisionRepository();
-      const latestDec = await decRepo.getLatest(resolved.id, effectiveDate);
+      const latestDec = await latestDecisionVisibleTo(userId, resolved.id, effectiveDate);
       generated.push(await this.createQuestion(userId, {
         securityId: resolved.id,
         category: 'DECISION_DRIFT',

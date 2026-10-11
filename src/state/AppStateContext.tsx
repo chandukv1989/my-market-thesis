@@ -91,6 +91,18 @@ export interface AppContextType {
 
 const AppContext = createContext<AppContextType | null>(null);
 
+const SCREEN_PATHS: ActiveScreen[] = [
+  'pilot-readiness', 'command-center', 'cross-investment', 'scenario-intelligence',
+  'counterfactual-intelligence', 'research-memory', 'investigation-planning', 'evidence-ledger',
+  'dashboard', 'discover', 'deep-dive', 'portfolio', 'strategies', 'backtesting',
+  'watchlist', 'alerts', 'research', 'monitor'
+];
+
+function screenFromPath(): ActiveScreen {
+  const seg = window.location.pathname.replace(/^\/+|\/+$/g, '').split('/')[0];
+  return (SCREEN_PATHS as string[]).includes(seg) ? (seg as ActiveScreen) : 'command-center';
+}
+
 export const AppStateProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // 1. Canonical Securities
   const [securities, setSecurities] = useState<Record<string, Stock>>(CANONICAL_SECURITIES_MAP);
@@ -382,7 +394,25 @@ export const AppStateProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   }, []);
 
   // 7. Global Navigation & Selected Stock
-  const [currentScreen, setCurrentScreen] = useState<ActiveScreen>('command-center');
+  const [currentScreen, setScreenState] = useState<ActiveScreen>(screenFromPath);
+
+  // Keep the URL path in sync with the active screen (e.g. /dashboard) and honour back/forward.
+  const setCurrentScreen = useCallback((screen: ActiveScreen) => {
+    setScreenState(screen);
+    const path = `/${screen}`;
+    if (window.location.pathname !== path) window.history.pushState(null, '', path);
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => setScreenState(screenFromPath());
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
+  useEffect(() => {
+    const path = `/${currentScreen}`;
+    if (window.location.pathname !== path) window.history.replaceState(null, '', path);
+  }, [currentScreen]);
   const [selectedSecurityId, setSelectedSecurityId] = useState<string>('us-nvda');
   const [selectedTicker, setSelectedTicker] = useState<string>('NVDA');
   const [activeResearchContext, setActiveResearchContext] = useState<{
@@ -399,6 +429,77 @@ export const AppStateProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       CANONICAL_SECURITIES_MAP['NVDA']
     );
   }, [securities, selectedSecurityId, selectedTicker, securitiesList]);
+
+  // Live quotes: the server (Twelve Data for US, Fyers for India) is the only source of real prices. Quotes are fetched
+  // for the stocks the user is actually looking at (watchlist, holdings, selected stock), capped to stay inside free-tier
+  // provider rate limits, and overlaid onto the stock objects with their provenance. Everything else stays labeled SAMPLE.
+  const liveTickersKey = useMemo(() => {
+    const set = new Set<string>([...watchlist, ...holdingPositions.map(h => h.ticker), selectedTicker].filter(Boolean).map(t => t.toUpperCase()));
+    return Array.from(set).slice(0, 14).join(',');
+  }, [watchlist, holdingPositions, selectedTicker]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const tickers = liveTickersKey ? liveTickersKey.split(',') : [];
+      if (tickers.length === 0) return;
+      const marketOf = (t: string): 'US' | 'INDIA' => (securities[t]?.market === 'INDIA' ? 'INDIA' : 'US');
+      const groups: Record<'US' | 'INDIA', string[]> = { US: [], INDIA: [] };
+      tickers.forEach(t => groups[marketOf(t)].push(t));
+      const updates: Record<string, Partial<Stock>> = {};
+      await Promise.all((['US', 'INDIA'] as const).map(async market => {
+        if (groups[market].length === 0) return;
+        try {
+          const res = await fetch('/api/market/batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify({ symbols: groups[market], market })
+          });
+          if (!res.ok) return; // not signed in yet / server error: leave labels as they are
+          const quotes = await res.json();
+          if (!Array.isArray(quotes)) return;
+          quotes.forEach((q: any) => {
+            const t = String(q?.ticker || q?.symbol || '').toUpperCase();
+            if (!t) return;
+            const ok = q.status !== 'unavailable' && Number.isFinite(q.price) && q.price > 0;
+            if (ok) {
+              updates[t] = {
+                price: q.price,
+                change: Number.isFinite(q.change) ? q.change : 0,
+                changePercent: Number.isFinite(q.changePercent) ? q.changePercent : 0,
+                priceStatus: q.isSimulated || q.epistemicStatus === 'SIMULATED' ? 'SIMULATED' : 'REAL',
+                priceProvider: q.provider,
+                priceAsOf: q.asOf,
+                priceReason: q.reason
+              };
+            } else {
+              updates[t] = { priceStatus: 'UNAVAILABLE', priceReason: q?.reason || 'Live quote could not be retrieved' };
+            }
+          });
+        } catch {
+          /* network error: keep existing labels */
+        }
+      }));
+      if (cancelled || Object.keys(updates).length === 0) return;
+      setSecurities(prev => {
+        const next = { ...prev };
+        for (const [t, patch] of Object.entries(updates)) {
+          const ids = Object.keys(next).filter(k => next[k]?.ticker?.toUpperCase() === t);
+          for (const k of ids) {
+            // never let a failed refresh overwrite a previously fetched real price with sample/unavailable text
+            if (patch.priceStatus === 'UNAVAILABLE' && next[k].priceStatus === 'REAL') continue;
+            next[k] = { ...next[k], ...patch };
+          }
+        }
+        return next;
+      });
+    };
+    void load();
+    const timer = setInterval(load, 90000);
+    return () => { cancelled = true; clearInterval(timer); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveTickersKey]);
 
   const handleSelectStock = useCallback((identifier: string) => {
     const raw = identifier.trim();

@@ -46,6 +46,7 @@ import {
 } from '../../../src/types';
 import { PostgresClient } from './postgresClient';
 import { MigrationRunner } from '../migrations/migrationRunner';
+import { MIGRATIONS, Migration } from '../migrations/schema';
 import {
   PostgresSecurityRepository,
   PostgresResearchDocumentRepository,
@@ -121,8 +122,11 @@ export class PostgresPersistenceAdapter implements IPersistenceAdapter {
   private evidenceRelationshipRepo!: IEvidenceRelationshipRepository;
   private evidenceAuditRepo!: IEvidenceAuditRepository;
 
-  constructor(client?: PostgresClient) {
+  private migrations: Migration[];
+
+  constructor(client?: PostgresClient, options: { migrations?: Migration[] } = {}) {
     this.client = client || new PostgresClient();
+    this.migrations = options.migrations || MIGRATIONS;
   }
 
   public get isConnected(): boolean {
@@ -136,7 +140,7 @@ export class PostgresPersistenceAdapter implements IPersistenceAdapter {
     }
 
     // Run migrations
-    this.migrationRunner = new MigrationRunner(this.client.getPool());
+    this.migrationRunner = new MigrationRunner(this.client.getPool(), this.migrations);
     const migrationResult = await this.migrationRunner.runMigrations();
     this.currentMigrationVersion = migrationResult.currentVersion;
 
@@ -182,10 +186,12 @@ export class PostgresPersistenceAdapter implements IPersistenceAdapter {
     return this.client.healthCheck();
   }
 
+  /**
+   * `work` may call any repository of this adapter; those calls execute on the transaction's single connection
+   * (PostgresClient routes queries through the active transaction context).
+   */
   public async runTransaction<T>(work: () => Promise<T>): Promise<T> {
-    return this.client.runTransaction(async () => {
-      return work();
-    });
+    return this.client.runTransaction(async () => work());
   }
 
   public getSecurityRepository(): ISecurityRepository { return this.securityRepo; }
@@ -310,7 +316,7 @@ export class PostgresPersistenceAdapter implements IPersistenceAdapter {
       migrationVersion: this.currentMigrationVersion,
       entityCounts: counts,
       details: {
-        diskBacked: true,
+        diskBacked: false,
         schemaVersion: '1.0.0'
       }
     };

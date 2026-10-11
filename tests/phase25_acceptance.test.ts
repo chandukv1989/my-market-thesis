@@ -13,11 +13,14 @@
  * - Scenario I: Epistemic status preservation & data quality changes
  */
 
+import { classifyLegacyFixturesSharedForTest } from './helpers/legacyFixtures';
 import { investmentMonitorEngine } from '../server/services/monitor/investmentMonitorEngine';
 import { persistenceManager } from '../server/persistence/persistenceManager';
 import { InvestmentEvent, ResearchSnapshot, HoldingPosition } from '../src/types';
 
 async function runAcceptanceScenarios() {
+  // Phase 38.2B: ownerless legacy fixtures are no longer implicitly visible; classify them explicitly (in-memory, test only).
+  await classifyLegacyFixturesSharedForTest();
   console.log('======================================================================');
   console.log('PHASE 25: REALISTIC ANALYST ACCEPTANCE SCENARIOS');
   console.log('======================================================================');
@@ -204,6 +207,7 @@ async function runAcceptanceScenarios() {
   const tBaseline = new Date().toISOString();
   await snapshotRepo.save({
     snapshotId: `snap_asml_base_${Date.now()}`,
+    visibility: 'SHARED', // Phase 38.2B: explicit classification of this fixture (ownerless is no longer implicitly visible)
     securityId: 'us-asml',
     notebookId: 'nb_us_asml',
     researchAsOfDate: tBaseline,
@@ -242,6 +246,7 @@ async function runAcceptanceScenarios() {
     evidenceGaps: { available: [], missing: [], unavailable: [] },
     createdAt: t3
   };
+  (deterioratedSnapshot as any).visibility = 'SHARED'; // Phase 38.2B explicit fixture classification
   (deterioratedSnapshot as any).metrics = {
     quant: {
       momentumScore: 28,

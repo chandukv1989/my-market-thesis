@@ -15,6 +15,7 @@
  * - Strict Invariants (isAnalyticalOnly: true, executionProhibited: true)
  */
 
+import { classifyLegacyFixturesSharedForTest } from './helpers/legacyFixtures';
 import { crossInvestmentService } from '../server/services/relationships/crossInvestmentService';
 import { persistenceManager } from '../server/persistence/persistenceManager';
 import { aiCircuitBreaker } from '../server/services/ai/aiCircuitBreaker';
@@ -35,6 +36,8 @@ function assert(condition: boolean, message: string) {
 }
 
 async function runPhase30AcceptanceTests() {
+  // Phase 38.2B: ownerless legacy fixtures are no longer implicitly visible; classify them explicitly (in-memory, test only).
+  await classifyLegacyFixturesSharedForTest();
   console.log('======================================================================');
   console.log('PHASE 30: CROSS-INVESTMENT INTELLIGENCE ACCEPTANCE TEST SUITE');
   console.log('======================================================================\n');

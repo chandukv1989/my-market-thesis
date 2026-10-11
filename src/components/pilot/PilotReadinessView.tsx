@@ -63,7 +63,7 @@ export const PilotReadinessView: React.FC<PilotReadinessViewProps> = ({
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch('/api/pilot/readiness?tenantId=analyst_pilot_01');
+      const res = await fetch('/api/pilot/readiness');
       if (!res.ok) {
         throw new Error(`Server returned HTTP ${res.status}: ${res.statusText}`);
       }
@@ -87,7 +87,7 @@ export const PilotReadinessView: React.FC<PilotReadinessViewProps> = ({
       const res = await fetch(`/api/pilot/workflow/${ticker}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenantId: 'analyst_pilot_01' })
+        body: JSON.stringify({})
       });
       if (!res.ok) throw new Error(`Workflow execution failed: HTTP ${res.status}`);
       const result: PilotWorkflowVerificationResult = await res.json();
@@ -114,7 +114,7 @@ export const PilotReadinessView: React.FC<PilotReadinessViewProps> = ({
       const res = await fetch(`/api/pilot/sec-ingest/${ticker}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tenantId: 'analyst_pilot_01', maxFilings: 5 })
+        body: JSON.stringify({ maxFilings: 5 })
       });
       if (!res.ok) throw new Error(`SEC ingestion failed: HTTP ${res.status}`);
       const result = await res.json();

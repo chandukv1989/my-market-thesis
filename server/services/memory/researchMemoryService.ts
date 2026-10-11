@@ -18,6 +18,7 @@
  * - Byte-identical 3-run deterministic structured output.
  */
 
+import { latestDecisionVisibleTo, latestSnapshotVisibleTo, visibleToEngine } from '../../auth/engineScope';
 import { GoogleGenAI } from '@google/genai';
 import {
   ResearchMemoryEntry,
@@ -484,7 +485,7 @@ export class ResearchMemoryService {
     let latestDecisionInfo: CurrentResearchState['latestDecision'];
     try {
       const decRepo = persistenceManager.getDecisionRepository();
-      const latestDec = await decRepo.getLatest(resolved.id, effectiveDate);
+      const latestDec = await latestDecisionVisibleTo(userId, resolved.id, effectiveDate);
       if (latestDec) {
         latestDecisionInfo = {
           decisionId: latestDec.decisionId,

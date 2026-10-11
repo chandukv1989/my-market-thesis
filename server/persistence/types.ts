@@ -73,7 +73,15 @@ export interface ISecurityRepository {
 export interface IResearchDocumentRepository {
   get(documentId: string): Promise<ResearchDocument | null>;
   getByHash(contentHash: string): Promise<ResearchDocument | null>;
+  /** @internal system/maintenance only (hydration, migration). Never expose through an API response. */
   getAll(filter?: { securityId?: string; documentType?: string; userId?: string }): Promise<ResearchDocument[]>;
+  /** Tenant-scoped read. `ownerUserId` is mandatory (throws TenantScopeError). Owner's documents + explicitly SHARED. */
+  getAllForOwner(ownerUserId: string, filter?: { securityId?: string; documentType?: string }): Promise<ResearchDocument[]>;
+  /**
+   * Phase 38.2E: durable owner-only delete. Removes the row only if it is owned by `ownerUserId` (never SHARED, never
+   * ownerless/legacy, never another tenant's). Returns whether a row was removed.
+   */
+  deleteForOwner(documentId: string, ownerUserId: string): Promise<boolean>;
   save(doc: ResearchDocument): Promise<{ saved: boolean; isDuplicate: boolean; document: ResearchDocument }>;
   updateStatus(documentId: string, status: DocumentProcessingStatus, metadata?: any): Promise<boolean>;
   count(): Promise<number>;
@@ -83,11 +91,20 @@ export interface IPersistentEvidenceRepository {
   addEvidence(item: EvidenceItem): Promise<boolean>;
   getEvidence(evidenceId: string): Promise<EvidenceItem | null>;
   get?(evidenceId: string): Promise<EvidenceItem | null>;
+  /** @internal system use only: not tenant filtered. */
   queryEvidence(filter: EvidenceFilter): Promise<EvidenceItem[]>;
+  /** Tenant-scoped read. `ownerUserId` is mandatory (throws TenantScopeError). Owner's items + explicitly SHARED. */
+  queryEvidenceForOwner(ownerUserId: string, filter: EvidenceFilter): Promise<EvidenceItem[]>;
+  /**
+   * Phase 38.2E: durable owner-only purge of PRIVATE evidence (used when its source document is deleted). Matches only
+   * rows owned by `ownerUserId`; SHARED provider evidence, legacy/ownerless and other tenants' rows are never touched.
+   */
+  deleteForOwner(evidenceId: string, ownerUserId: string): Promise<boolean>;
   getBySecurityId?(securityId: string, asOfDate?: string): Promise<EvidenceItem[]>;
   getHistoricalEvidence(evidenceId: string, asOfDate?: string): Promise<EvidenceItem | null>;
   getEvidenceLineage(evidenceId: string): Promise<EvidenceItem[]>;
   count(): Promise<number>;
+  /** @internal system/hydration only. */
   getAll(): Promise<EvidenceItem[]>;
 }
 
@@ -95,14 +112,20 @@ export interface IResearchNotebookRepository {
   get(notebookId: string): Promise<ResearchNotebook | null>;
   getBySecurityId(securityId: string): Promise<ResearchNotebook | null>;
   save(notebook: ResearchNotebook): Promise<ResearchNotebook>;
+  /** @internal system/hydration only. */
   getAll(): Promise<ResearchNotebook[]>;
+  /** Tenant-scoped read; `ownerUserId` is mandatory (throws TenantScopeError). */
+  getAllForOwner(ownerUserId: string): Promise<ResearchNotebook[]>;
   count(): Promise<number>;
 }
 
 export interface IResearchSnapshotRepository {
   get(snapshotId: string): Promise<ResearchSnapshot | null>;
   getByNotebookId(notebookId: string): Promise<ResearchSnapshot[]>;
+  /** @internal system use only: not tenant filtered. */
   getBySecurityId(securityId: string): Promise<ResearchSnapshot[]>;
+  /** Tenant-scoped read; `ownerUserId` is mandatory (throws TenantScopeError). */
+  getBySecurityIdForOwner(securityId: string, ownerUserId: string): Promise<ResearchSnapshot[]>;
   getLatest(securityId: string, asOfDate?: string): Promise<ResearchSnapshot | null>;
   save(snapshot: ResearchSnapshot): Promise<ResearchSnapshot>; // IMMUTABLE
   getAll(): Promise<ResearchSnapshot[]>;
@@ -112,7 +135,10 @@ export interface IResearchSnapshotRepository {
 export interface IDecisionRepository {
   get(decisionId: string): Promise<InvestmentDecisionAssessment | null>;
   getLatest(securityId: string, asOfDate?: string): Promise<InvestmentDecisionAssessment | null>;
+  /** @internal system use only: not tenant filtered. */
   getHistory(securityId: string): Promise<InvestmentDecisionAssessment[]>;
+  /** Tenant-scoped read; `ownerUserId` is mandatory (throws TenantScopeError). */
+  getHistoryForOwner(securityId: string, ownerUserId: string): Promise<InvestmentDecisionAssessment[]>;
   save(decision: InvestmentDecisionAssessment): Promise<InvestmentDecisionAssessment>; // IMMUTABLE
   getAll(): Promise<InvestmentDecisionAssessment[]>;
   count(): Promise<number>;
@@ -120,7 +146,10 @@ export interface IDecisionRepository {
 
 export interface IStrategyRepository {
   get(strategyId: string, version?: string): Promise<Strategy | null>;
+  /** @internal system use only: not tenant filtered. */
   getAll(): Promise<Strategy[]>;
+  /** Tenant-scoped read; `ownerUserId` is mandatory (throws TenantScopeError). */
+  getAllForOwner(ownerUserId: string): Promise<Strategy[]>;
   save(strategy: Strategy): Promise<Strategy>;
   count(): Promise<number>;
 }
@@ -128,7 +157,10 @@ export interface IStrategyRepository {
 export interface IBacktestRepository {
   get(backtestId: string): Promise<BacktestResult | null>;
   getByStrategyId(strategyId: string): Promise<BacktestResult[]>;
+  /** @internal system/hydration only. */
   getAll(): Promise<BacktestResult[]>;
+  /** Tenant-scoped read; `ownerUserId` is mandatory (throws TenantScopeError). */
+  getAllForOwner(ownerUserId: string): Promise<BacktestResult[]>;
   save(backtest: BacktestResult): Promise<BacktestResult>; // IMMUTABLE
   count(): Promise<number>;
 }
@@ -142,7 +174,10 @@ export interface IWatchlistRepository {
 
 export interface IAlertRepository {
   get(alertId: string): Promise<AlertItem | null>;
+  /** @internal system use only: not tenant filtered. */
   getAll(): Promise<AlertItem[]>;
+  /** Tenant-scoped read; `ownerUserId` is mandatory (throws TenantScopeError). */
+  getAllForOwner(ownerUserId: string): Promise<AlertItem[]>;
   save(alert: AlertItem): Promise<AlertItem>;
   saveMany(alerts: AlertItem[]): Promise<number>;
   update(alertId: string, updates: Partial<AlertItem>): Promise<boolean>;
@@ -157,7 +192,10 @@ export interface IPortfolioRepository {
 
 export interface IResearchQueryRepository {
   get(queryId: string): Promise<ResearchQueryItem | null>;
+  /** @internal system use only: not tenant filtered. */
   getAll(): Promise<ResearchQueryItem[]>;
+  /** Tenant-scoped read; `ownerUserId` is mandatory (throws TenantScopeError). */
+  getAllForOwner(ownerUserId: string): Promise<ResearchQueryItem[]>;
   save(query: ResearchQueryItem): Promise<ResearchQueryItem>;
   count(): Promise<number>;
 }

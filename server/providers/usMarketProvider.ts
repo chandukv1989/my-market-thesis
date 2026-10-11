@@ -298,6 +298,7 @@ export class USMarketProvider implements RegionalMarketProvider {
           price: 0,
           change: 0,
           changePercent: 0,
+          volume: undefined,
           currency: 'USD',
           market: 'US',
           exchange,
@@ -312,8 +313,35 @@ export class USMarketProvider implements RegionalMarketProvider {
         };
       }
 
+      // Price validation: must be positive finite; zero, negative, NaN, or Infinity are invalid
+      const priceRaw = parseFloat(data.close || data.price || '0');
+      if (!Number.isFinite(priceRaw) || priceRaw <= 0) {
+        const failReason = `Invalid price returned (${priceRaw}); data rejected`;
+        this.lastError = failReason;
+        return {
+          ticker: sym,
+          symbol: sym,
+          securityId,
+          price: 0,
+          change: 0,
+          changePercent: 0,
+          volume: undefined,
+          currency: 'USD',
+          market: 'US',
+          exchange,
+          asOf: now,
+          retrievedAt: now,
+          provider: 'Twelve Data',
+          isSimulated: false,
+          epistemicCategory: 'REAL',
+          epistemicStatus: 'UNAVAILABLE',
+          status: 'unavailable',
+          reason: failReason
+        };
+      }
+
       // Valid Quote Response
-      const price = parseFloat(data.close || data.price || '0');
+      const price = priceRaw;
       const change = parseFloat(data.change || '0');
       const changePercent = parseFloat(data.percent_change || '0');
       const rawVol = data.volume;
@@ -509,11 +537,14 @@ export class USMarketProvider implements RegionalMarketProvider {
       const bars: HistoricalPriceBar[] = (data.values as TwelveValue[])
         .map((v) => {
           const c = parseFloat(v.close);
+          const o = parseFloat(v.open);
+          const h = parseFloat(v.high);
+          const l = parseFloat(v.low);
           return {
             timestamp: v.datetime,
-            open: parseFloat(v.open),
-            high: parseFloat(v.high),
-            low: parseFloat(v.low),
+            open: o,
+            high: h,
+            low: l,
             close: c,
             adjustedClose: c,
             volume: parseInt(v.volume || '0', 10),
@@ -525,7 +556,15 @@ export class USMarketProvider implements RegionalMarketProvider {
             epistemicStatus: 'REAL' as const
           };
         })
-        .filter((b) => !isNaN(b.close) && !isNaN(b.open) && b.close > 0)
+        .filter((b) => {
+          // Price must be positive and finite; OHLC relationships must hold
+          return !isNaN(b.open) && b.open > 0 &&
+                 !isNaN(b.high) && b.high > 0 &&
+                 !isNaN(b.low) && b.low > 0 &&
+                 !isNaN(b.close) && b.close > 0 &&
+                 b.high >= b.open && b.high >= b.close && b.high >= b.low &&
+                 b.low <= b.open && b.low <= b.close && b.low <= b.high;
+        })
         .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
 
       const response: HistoricalPricesResponse = {

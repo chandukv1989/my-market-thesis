@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Stock, PortfolioData, EvidenceSource, ActiveScreen } from '../types';
 import { ProvenanceBadge } from './common/ProvenanceBadge';
 import { ThesisStatusBadge } from './common/ThesisStatusBadge';
@@ -46,6 +46,30 @@ export const StockDeepDiveView: React.FC<StockDeepDiveViewProps> = ({
 }) => {
   const [activeTab, setActiveTab] = useState<'thesis' | 'decision' | 'events' | 'financials' | 'committee' | 'fit' | 'evidence'>('decision');
   const [expandedPillar, setExpandedPillar] = useState<number | null>(0);
+
+  // Live quote (server-side provider). The static price on `stock` is sample data and is never shown as if it were live.
+  type LiveQuote = { price: number; change: number; changePercent: number; status?: string; epistemicStatus?: string; isSimulated?: boolean; provider?: string; asOf?: string; reason?: string };
+  const [liveQuote, setLiveQuote] = useState<LiveQuote | null>(null);
+  const [quoteState, setQuoteState] = useState<'loading' | 'ready' | 'unavailable'>('loading');
+  useEffect(() => {
+    let cancelled = false;
+    setQuoteState('loading');
+    setLiveQuote(null);
+    fetch(`/api/market/quote/${encodeURIComponent(stock.ticker.toUpperCase())}?market=${stock.market === 'INDIA' ? 'INDIA' : 'US'}`, { credentials: 'same-origin' })
+      .then(r => (r.ok ? r.json() : null))
+      .then((q: LiveQuote | null) => {
+        if (cancelled) return;
+        if (q && q.status !== 'unavailable' && Number.isFinite(q.price) && q.price > 0) {
+          setLiveQuote(q);
+          setQuoteState('ready');
+        } else {
+          setLiveQuote(q);
+          setQuoteState('unavailable');
+        }
+      })
+      .catch(() => { if (!cancelled) setQuoteState('unavailable'); });
+    return () => { cancelled = true; };
+  }, [stock.ticker, stock.market]);
 
   const tabs = [
     { id: 'decision' as const, label: 'Investment Assessment' },
@@ -145,18 +169,36 @@ export const StockDeepDiveView: React.FC<StockDeepDiveViewProps> = ({
           {/* Current Market Price & Today Change */}
           <div className="flex items-center gap-4">
             <div className="text-right">
-              <div className="font-mono-data text-3xl font-bold text-[#d4e4fa] tracking-tight">
-                {currSymbol}{stock.price.toFixed(2)}
-              </div>
-              <div className={`font-mono-data text-xs font-semibold flex items-center justify-end gap-1 ${
-                stock.changePercent >= 0 ? 'text-[#34d399]' : 'text-[#f43f5e]'
-              }`}>
-                {stock.changePercent >= 0 ? <TrendingUp className="w-3.5 h-3.5" /> : <TrendingDown className="w-3.5 h-3.5" />}
-                <span>
-                  {stock.changePercent >= 0 ? '+' : ''}{currSymbol}{stock.change.toFixed(2)} ({stock.changePercent >= 0 ? '+' : ''}{stock.changePercent.toFixed(2)}%)
-                </span>
-                <span className="text-[#87929a] font-normal text-[10px]">Today</span>
-              </div>
+              {quoteState === 'ready' && liveQuote ? (
+                <>
+                  <div className="font-mono-data text-3xl font-bold text-[#d4e4fa] tracking-tight">
+                    {currSymbol}{liveQuote.price.toFixed(2)}
+                  </div>
+                  <div className={`font-mono-data text-xs font-semibold flex items-center justify-end gap-1 ${
+                    liveQuote.changePercent >= 0 ? 'text-[#34d399]' : 'text-[#f43f5e]'
+                  }`}>
+                    {liveQuote.changePercent >= 0 ? <TrendingUp className="w-3.5 h-3.5" /> : <TrendingDown className="w-3.5 h-3.5" />}
+                    <span>
+                      {liveQuote.changePercent >= 0 ? '+' : ''}{currSymbol}{liveQuote.change.toFixed(2)} ({liveQuote.changePercent >= 0 ? '+' : ''}{liveQuote.changePercent.toFixed(2)}%)
+                    </span>
+                  </div>
+                  <div className="font-mono-data text-[10px] text-[#87929a]">
+                    {liveQuote.isSimulated || liveQuote.epistemicStatus === 'SIMULATED' ? 'SIMULATED' : (liveQuote.epistemicStatus || 'REAL')} · {liveQuote.provider || 'provider'} · as of {liveQuote.asOf ? String(liveQuote.asOf).slice(0, 10) : 'n/a'}
+                  </div>
+                  {(liveQuote.isSimulated || liveQuote.epistemicStatus === 'SIMULATED') && (
+                    <div className="font-mono-data text-[10px] font-bold text-[#f59e0b] max-w-[240px]" title={liveQuote.reason}>
+                      ⚠ SIMULATED PRICE, NOT A MARKET QUOTE{liveQuote.reason ? ` (${liveQuote.reason})` : ''}
+                    </div>
+                  )}
+                </>
+              ) : quoteState === 'loading' ? (
+                <div className="font-mono-data text-sm text-[#87929a]">Loading live price…</div>
+              ) : (
+                <div className="text-right">
+                  <div className="font-mono-data text-xl font-bold text-[#f59e0b]">Price UNAVAILABLE</div>
+                  <div className="font-mono-data text-[10px] text-[#87929a] max-w-[220px]">{liveQuote?.reason || 'Live quote could not be retrieved. Sample price intentionally not shown.'}</div>
+                </div>
+              )}
             </div>
 
             <button

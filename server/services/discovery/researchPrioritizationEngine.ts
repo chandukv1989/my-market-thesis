@@ -15,6 +15,7 @@
  * - Multi-currency strict separation (USD vs INR).
  */
 
+import { latestDecisionVisibleTo, latestSnapshotVisibleTo, visibleToEngine } from '../../auth/engineScope';
 import {
   CanonicalSecurity,
   ResearchPriorityLevel,
@@ -126,10 +127,7 @@ export class ResearchPrioritizationEngine {
 
     // 4. Research notebooks for userId
     const allNotebooks = await notebookRepo.getAll();
-    const userNotebooks = allNotebooks.filter(nb => {
-      const owner = nb.ownerUserId || nb.userId;
-      return !owner || owner === userId;
-    });
+    const userNotebooks = allNotebooks.filter(nb => visibleToEngine(nb, userId));
 
     if (universeType === 'PORTFOLIO') {
       for (const pos of userPositions) {
@@ -396,7 +394,7 @@ export class ResearchPrioritizationEngine {
     // 3. Check Decision Intelligence up to asOfDate
     let pitDecisions: any[] = [];
     try {
-      const decisions = await decisionRepo.getHistory(security.securityId);
+      const decisions = (await decisionRepo.getHistory(security.securityId)).filter(d => visibleToEngine(d, userId));
       pitDecisions = decisions.filter(d => new Date(d.generatedAt || d.asOfDate).getTime() <= effectiveAsOf);
       pitDecisions.sort((a, b) => new Date(b.generatedAt || b.asOfDate).getTime() - new Date(a.generatedAt || a.asOfDate).getTime());
     } catch (err) {

@@ -1,3 +1,4 @@
+import { useAuth } from '../../state/AuthContext';
 import React, { useState, useEffect } from 'react';
 import {
   ShieldAlert,
@@ -45,6 +46,7 @@ export const PortfolioScenarioView: React.FC<PortfolioScenarioViewProps> = ({
   onNavigate,
   onSelectStock
 }) => {
+  const authUserId = useAuth().user?.userId ?? '';
   const [presets, setPresets] = useState<ScenarioPreset[]>([]);
   const [selectedPresetId, setSelectedPresetId] = useState<string>('preset_us_tech_15');
   const [activeTab, setActiveTab] = useState<'table' | 'paths' | 'comparison' | 'snapshots'>('table');
@@ -208,7 +210,7 @@ export const PortfolioScenarioView: React.FC<PortfolioScenarioViewProps> = ({
       const title = snapshotTitle.trim() || `${evaluation.name} Snapshot (${asOfDate})`;
       const snap: PortfolioScenarioSnapshot = {
         snapshotId: `snap::scen::${Date.now()}`,
-        userId: 'analyst-1',
+        userId: authUserId, // informational only: the server always stamps the authenticated principal
         title,
         scenarioType: evaluation.scenarioType,
         asOfDate: evaluation.asOfDate,

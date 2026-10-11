@@ -14,6 +14,8 @@
  * 6. No credentials, tokens, or authorization headers are ever logged or serialized.
  */
 
+import { latestDecisionVisibleTo, latestSnapshotVisibleTo, visibleToEngine } from '../../auth/engineScope';
+import { requireTenantScope } from '../../auth/accessPolicy';
 import { GoogleGenAI } from '@google/genai';
 import { aiCircuitBreaker } from '../ai/aiCircuitBreaker';
 import {
@@ -215,19 +217,36 @@ export class WatchlistAlertService {
   public getWatchlist(userId?: string): CanonicalWatchlistItem[] {
     const list = Array.from(this.watchlist.values());
     if (userId) {
-      return list.filter(w => !w.ownerUserId || w.ownerUserId === userId);
+      // Phase 38.2A: strict ownership. Ownerless (legacy/seed) items are never visible to a scoped caller.
+      return list.filter(w => w.ownerUserId === userId);
     }
     return list;
   }
 
-  public getWatchlistItem(idOrSymbol: string): CanonicalWatchlistItem | undefined {
+  public getWatchlistItem(idOrSymbol: string, ownerUserId?: string): CanonicalWatchlistItem | undefined {
     if (this.watchlist.has(idOrSymbol)) {
       return this.watchlist.get(idOrSymbol);
     }
     const upper = idOrSymbol.toUpperCase();
-    return Array.from(this.watchlist.values()).find(
+    const matches = Array.from(this.watchlist.values()).filter(
       w => w.symbol.toUpperCase() === upper || w.securityId.toUpperCase() === upper || w.watchlistItemId === idOrSymbol
     );
+    // Phase 38.2A: when a caller scope is supplied, a symbol lookup must resolve to the caller's own item.
+    if (ownerUserId) return matches.find(w => w.ownerUserId === ownerUserId);
+    return matches[0];
+  }
+
+  /** Tenant-scoped accessors: the scope is mandatory (throws TenantScopeError when missing). */
+  public getWatchlistForUser(userId: string): CanonicalWatchlistItem[] {
+    return this.getWatchlist(requireTenantScope(userId));
+  }
+
+  public getAlertRulesForUser(userId: string, filter?: { securityId?: string; symbol?: string; enabled?: boolean; alertType?: AlertRuleType }): AlertRule[] {
+    return this.getAlertRules({ ...(filter || {}), userId: requireTenantScope(userId) });
+  }
+
+  public getAlertEventsForUser(userId: string, filter?: { isRead?: boolean; priority?: AlertPriority; securityId?: string; limit?: number }): AlertEvent[] {
+    return this.getAlertEvents({ ...(filter || {}), userId: requireTenantScope(userId) });
   }
 
   public addWatchlistItem(item: {
@@ -253,7 +272,7 @@ export class WatchlistAlertService {
     // Check if already in watchlist
     const existing = Array.from(this.watchlist.values()).find(
       w => (w.securityId.toLowerCase() === securityId.toLowerCase() || (w.symbol.toUpperCase() === canonicalSym && w.exchange.toUpperCase() === exchange.toUpperCase())) &&
-           (!item.ownerUserId || w.ownerUserId === item.ownerUserId)
+           w.ownerUserId === item.ownerUserId
     );
     if (existing) {
       if (item.notes) existing.notes = item.notes;
@@ -312,7 +331,7 @@ export class WatchlistAlertService {
     let result = Array.from(this.rules.values());
     if (filter) {
       if (filter.userId) {
-        result = result.filter(r => !r.ownerUserId || r.ownerUserId === filter.userId);
+        result = result.filter(r => r.ownerUserId === filter.userId);
       }
       if (filter.securityId) {
         result = result.filter(r => r.securityId?.toLowerCase() === filter.securityId?.toLowerCase());
@@ -387,7 +406,7 @@ export class WatchlistAlertService {
 
     // Link to watchlist item if securityId matches
     if (newRule.securityId || newRule.symbol) {
-      const match = this.getWatchlistItem(newRule.securityId || newRule.symbol!);
+      const match = this.getWatchlistItem(newRule.securityId || newRule.symbol!, resolvedOwner);
       if (match && !match.alertRuleIds.includes(alertRuleId)) {
         match.alertRuleIds.push(alertRuleId);
       }
@@ -441,7 +460,7 @@ export class WatchlistAlertService {
     let result = [...this.events];
     if (filter) {
       if (filter.userId) {
-        result = result.filter(e => !e.ownerUserId || e.ownerUserId === filter.userId);
+        result = result.filter(e => e.ownerUserId === filter.userId);
       }
       if (filter.isRead !== undefined) {
         result = result.filter(e => e.isRead === filter.isRead);
@@ -494,7 +513,7 @@ export class WatchlistAlertService {
    * Evaluates all enabled alert rules deterministically.
    * Utilizes batch market data retrieval to optimize provider calls.
    */
-  public async evaluateAll(options?: { force?: boolean; asOfDate?: string }): Promise<{
+  public async evaluateAll(options?: { force?: boolean; asOfDate?: string; ownerUserId?: string }): Promise<{
     evaluatedCount: number;
     triggeredCount: number;
     newEvents: AlertEvent[];
@@ -502,7 +521,10 @@ export class WatchlistAlertService {
     timestamp: string;
   }> {
     const now = options?.asOfDate || new Date().toISOString();
-    const enabledRules = Array.from(this.rules.values()).filter(r => r.enabled);
+    // Phase 38.2A: when an owner scope is supplied (HTTP callers), only that owner's rules are evaluated.
+    const enabledRules = Array.from(this.rules.values()).filter(
+      r => r.enabled && (!options?.ownerUserId || r.ownerUserId === options.ownerUserId)
+    );
 
     if (enabledRules.length === 0) {
       return {
@@ -522,6 +544,7 @@ export class WatchlistAlertService {
 
     // Also include symbols from enabled watchlist items
     this.watchlist.forEach(w => {
+      if (options?.ownerUserId && w.ownerUserId !== options.ownerUserId) return;
       if (w.enabled && w.symbol) symbolsToQuery.add(w.symbol.toUpperCase());
     });
 
@@ -571,7 +594,7 @@ export class WatchlistAlertService {
         if (rule.alertType === 'THESIS_INVALIDATED' || rule.alertType === 'THESIS_RECOVERED') {
           if (resolved) {
             try {
-              const history = await persistenceManager.getDecisionRepository().getHistory(resolved.id);
+              const history = (await persistenceManager.getDecisionRepository().getHistory(resolved.id)).filter(d => visibleToEngine(d, rule.ownerUserId));
               if (history && history.length > 0) {
                 history.sort((a, b) => (a.asOfDate || '').localeCompare(b.asOfDate || ''));
                 decisionAssessment = history[history.length - 1];
@@ -596,7 +619,7 @@ export class WatchlistAlertService {
           }
         } else if (rule.alertType === 'RESEARCH_SNAPSHOT_CHANGED') {
           try {
-            const snaps = await persistenceManager.getSnapshotRepository().getBySecurityId(secId);
+            const snaps = (await persistenceManager.getSnapshotRepository().getBySecurityId(secId)).filter(sn => visibleToEngine(sn, rule.ownerUserId));
             if (snaps && snaps.length > 0) {
               snaps.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
               researchSnapshot = snaps[snaps.length - 1];

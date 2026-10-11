@@ -15,6 +15,7 @@
  * - Centralized AI Resilience: uses aiCircuitBreaker for optional executive briefing
  */
 
+import { visibleToEngine } from '../../auth/engineScope';
 import { GoogleGenAI } from '@google/genai';
 import {
   CanonicalSecurity,
@@ -250,7 +251,7 @@ export class CrossInvestmentService {
     const decisionRepo = persistenceManager.getDecisionRepository();
     const rawDecisions = await decisionRepo.getAll();
     const pitDecisions = rawDecisions.filter(d => {
-      const isOwner = !d.ownerUserId || d.ownerUserId === userId;
+      const isOwner = visibleToEngine(d, userId);
       const decTime = new Date(d.asOfDate).getTime();
       return isOwner && decTime <= asOfTimestamp;
     });
@@ -258,7 +259,7 @@ export class CrossInvestmentService {
     // Evidence Service items (tenant-isolated & PIT)
     const allEvidence = await persistenceManager.getEvidenceRepository().getAll();
     const pitEvidence = allEvidence.filter(ev => {
-      const isOwner = !(ev as any).ownerUserId || (ev as any).ownerUserId === userId;
+      const isOwner = visibleToEngine(ev, userId);
       const evTime = ev.filingDate ? new Date(ev.filingDate).getTime() : new Date((ev as any).timestamp || (ev as any).publishedAt || 0).getTime();
       return isOwner && evTime <= asOfTimestamp;
     });

@@ -13,6 +13,7 @@
  * 6. AI Guardrail: Gemini is strictly used for synthesis phrasing if available; it CANNOT invent events, calculate deltas, change thesis health, or trigger execution.
  */
 
+import { latestDecisionVisibleTo, latestSnapshotVisibleTo, visibleToEngine } from '../../auth/engineScope';
 import { GoogleGenAI } from '@google/genai';
 import { aiCircuitBreaker } from '../ai/aiCircuitBreaker';
 import {
@@ -108,8 +109,9 @@ export class InvestmentMonitorEngine {
       const secTicker = sec.symbol;
 
       // Check for decision
-      const decision = await decisionRepo.getLatest(secId);
-      const snapshot = await snapshotRepo.getLatest(secId);
+      // Seed monitors may only baseline on SHARED (system) artifacts, never on another tenant's or legacy records.
+      const decision = await latestDecisionVisibleTo(undefined, secId);
+      const snapshot = await latestSnapshotVisibleTo(undefined, secId);
       const positions = await portfolioRepo.getPositions('default');
       const holding = positions.find(p => p.ticker === secTicker || p.securityId === secId);
 
@@ -187,11 +189,12 @@ export class InvestmentMonitorEngine {
     const snapshotRepo = persistenceManager.getSnapshotRepository();
     const portfolioRepo = persistenceManager.getPortfolioRepository();
 
-    const decision = await decisionRepo.getLatest(secId);
-    let snapshot = await snapshotRepo.getLatest(secId);
+    const decision = await latestDecisionVisibleTo(userId, secId);
+    let snapshot = await latestSnapshotVisibleTo(userId, secId);
     if (!snapshot) {
       snapshot = await snapshotRepo.save({
         snapshotId: `snap_${secId.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}_baseline`,
+        visibility: 'SHARED', // system-generated generic baseline (no user content)
         notebookId: `nb_${secId.toLowerCase().replace(/[^a-z0-9_-]/g, '_')}`,
         securityId: secId,
         asOfDate: now,
@@ -409,30 +412,34 @@ export class InvestmentMonitorEngine {
     });
 
     // 5. Fetch evidence
-    const allEvidence = await evidenceRepo.queryEvidence({
+    const allEvidence = (await evidenceRepo.queryEvidence({
       securityId: monitor.securityId,
       asOfDate: nowIso
-    });
+    })).filter(ev => visibleToEngine(ev, userId));
     const newEvidence = allEvidence.filter(ev => {
       const pub = ev.publishedAt || ev.retrievedAt;
       return pub > baselineCutoff && pub <= nowIso;
     });
 
     // 6. Fetch decision assessment
-    const currentDecision = await decisionRepo.getLatest(monitor.securityId, nowIso);
+    const currentDecision = await latestDecisionVisibleTo(userId, monitor.securityId, nowIso);
     let previousDecision: InvestmentDecisionAssessment | null = null;
     const priorDecisionId = monitor.latestDecisionId || monitor.baselineDecisionId;
     if (priorDecisionId) {
-      previousDecision = await decisionRepo.get(priorDecisionId);
+      const prior = await decisionRepo.get(priorDecisionId);
+      previousDecision = prior && visibleToEngine(prior, userId) ? prior : null;
     }
 
-    // 7. Fetch notebook
-    const notebook = await notebookRepo.getBySecurityId(monitor.securityId);
-    const currentSnapshot = await snapshotRepo.getLatest(monitor.securityId, nowIso);
+    // 7. Fetch notebook (the caller's own notebook for the security, else an ownerless system notebook)
+    const ownNotebook = (await notebookRepo.getAllForOwner(userId)).find(n => n.securityId === monitor.securityId);
+    const rawNotebook = ownNotebook || (await notebookRepo.getBySecurityId(monitor.securityId));
+    const notebook = rawNotebook && visibleToEngine(rawNotebook, userId) ? rawNotebook : null;
+    const currentSnapshot = await latestSnapshotVisibleTo(userId, monitor.securityId, nowIso);
     let previousSnapshot: ResearchSnapshot | null = null;
     const priorSnapshotId = monitor.latestSnapshotId || monitor.baselineSnapshotId;
     if (priorSnapshotId) {
-      previousSnapshot = await snapshotRepo.get(priorSnapshotId);
+      const priorSnap = await snapshotRepo.get(priorSnapshotId);
+      previousSnapshot = priorSnap && visibleToEngine(priorSnap, userId) ? priorSnap : null;
     }
 
     // 8. Fetch portfolio positions
@@ -1088,9 +1095,11 @@ export class InvestmentMonitorEngine {
       reviewedAt: nowIso,
       asOfDate: nowIso.split('T')[0],
       previousReviewId: lastReview?.reviewId,
-      previousDecisionId: monitor.latestDecisionId || monitor.baselineDecisionId,
+      // Only reference artifacts the caller may see: a pointer to a legacy/ownerless or foreign record must not surface in
+      // derived output (the monitor keeps its own stored pointers untouched).
+      previousDecisionId: previousDecision?.decisionId,
       currentDecisionId: currentDecision?.decisionId,
-      previousSnapshotId: monitor.latestSnapshotId || monitor.baselineSnapshotId,
+      previousSnapshotId: previousSnapshot?.snapshotId,
       currentSnapshotId: currentSnapshot?.snapshotId,
       changeSummary,
       changes,

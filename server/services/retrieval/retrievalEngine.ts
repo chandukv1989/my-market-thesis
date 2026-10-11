@@ -6,6 +6,7 @@
  * epistemic weighting, source diversity, and provenance tracing.
  */
 
+import { canRead } from '../../auth/accessPolicy';
 import {
   EvidenceItem,
   EvidenceChunk,
@@ -221,20 +222,10 @@ export class RetrievalEngine implements IRetrievalEngine {
       }
     }
 
-    // User data isolation: public evidence items (no ownerUserId) are accessible to all,
-    // while user-owned evidence items are only visible to their respective owner.
-    if (query.userId) {
-      candidates = candidates.filter(item => {
-        const itemOwner = item.ownerUserId || (item as any).userId;
-        return !itemOwner || itemOwner === query.userId;
-      });
-    } else {
-      // If query does not specify a userId, only public evidence is retrieved
-      candidates = candidates.filter(item => {
-        const itemOwner = item.ownerUserId || (item as any).userId;
-        return !itemOwner;
-      });
-    }
+    // Phase 38.2A user data isolation (fail-closed): a candidate is retrievable only if it is owned by the
+    // querying user or explicitly classified SHARED. A missing owner never implies public; with no userId
+    // only SHARED evidence is retrievable.
+    candidates = candidates.filter(item => canRead(item, query.userId));
 
     const candidatesAfterMetadataFilter = candidates.length;
 

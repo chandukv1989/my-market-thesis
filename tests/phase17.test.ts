@@ -369,8 +369,9 @@ async function runPhase17Tests() {
     fileText: 'NVIDIA Corporation today announced quarterly financials and revenue of $35 billion for Q3, up 94% year-over-year.',
     documentType: 'SEC_FILING',
     securityId: 'us-nvda',
-    uploadedBy: 'sec_edgar'
-    // No ownerUserId: public to all users
+    uploadedBy: 'sec_edgar',
+    // Phase 38.2A: a missing owner no longer implies public. Public/shared documents are explicitly classified.
+    visibility: 'SHARED'
   });
   assert(publicDoc.document.processingStatus === 'READY', 'Public SEC document ingested');
 

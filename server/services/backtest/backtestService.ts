@@ -5,6 +5,7 @@
  * Manages deterministic caching, parameter validation, and result retention.
  */
 
+import { canRead, requireTenantScope, resolveOwnerId } from '../../auth/accessPolicy';
 import { BacktestConfiguration, BacktestResult, HistoricalPriceBar } from '../../../src/types';
 import { backtestEngine, BacktestEngine } from './backtestEngine';
 import { persistenceManager } from '../../persistence/persistenceManager';
@@ -33,7 +34,16 @@ export class BacktestService {
     providedBars?: HistoricalPriceBar[],
     benchmarkBars?: HistoricalPriceBar[]
   ): Promise<BacktestResult> {
-    const cacheKey = this.generateCacheKey(config);
+    const owner = resolveOwnerId(config as any);
+    const cacheKey = `${owner || 'shared'}|${this.generateCacheKey(config)}`;
+
+    // Phase 38.2A: a caller-supplied backtestId must never overwrite another tenant's (or an unowned) result.
+    if (config.backtestId) {
+      const clash = this.resultsCache.get(config.backtestId);
+      if (clash && resolveOwnerId(clash as any) !== owner) {
+        throw new Error(`Backtest id '${config.backtestId}' is already in use.`);
+      }
+    }
 
     // If no custom provided bars and already cached, return deterministic result
     if (!providedBars && !benchmarkBars && this.resultsCache.has(cacheKey)) {
@@ -42,6 +52,13 @@ export class BacktestService {
     }
 
     const result = await this.engine.runBacktest(config, providedBars, benchmarkBars);
+
+    // Phase 38.2A: ownership is always stamped by the server onto the artifact (never trusted from the body).
+    if (owner) {
+      (result as any).ownerUserId = owner;
+      (result as any).userId = owner;
+      (result as any).visibility = 'PRIVATE';
+    }
 
     if (result.status === 'COMPLETED' && !providedBars && !benchmarkBars) {
       this.resultsCache.set(cacheKey, result);
@@ -101,8 +118,14 @@ export class BacktestService {
     }
   }
 
+  /** Tenant-scoped listing (mandatory scope). Ownerless legacy results are never returned. */
+  public getAllBacktestsForOwner(ownerUserId: string): BacktestResult[] {
+    const scope = requireTenantScope(ownerUserId);
+    return this.getAllBacktests().filter(b => canRead(b as any, scope));
+  }
+
   /**
-   * Retrieve all completed backtest results.
+   * Retrieve all completed backtest results (INTERNAL: all owners; must never back an HTTP response).
    */
   public getAllBacktests(): BacktestResult[] {
     const unique = new Map<string, BacktestResult>();

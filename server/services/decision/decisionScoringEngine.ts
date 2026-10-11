@@ -48,6 +48,8 @@ export interface DecisionScoringInputs {
     operatingMarginTrend?: 'EXPANDING' | 'STABLE' | 'CONTRACTING';
     netIncomeTrend?: 'GROWING' | 'FLAT' | 'DECLINING';
     operatingCashFlowTrend?: 'POSITIVE' | 'NEUTRAL' | 'NEGATIVE';
+    revenueGrowthPct?: number;
+    operatingMarginPct?: number;
     periodsCount: number;
     peRatio?: number | null;
     priceToSales?: number | null;
@@ -401,6 +403,8 @@ export class DecisionScoringEngine {
         operatingMarginTrend: inputs.financials?.operatingMarginTrend || 'UNKNOWN',
         netIncomeTrend: inputs.financials?.netIncomeTrend || 'UNKNOWN',
         operatingCashFlowTrend: inputs.financials?.operatingCashFlowTrend || 'UNKNOWN',
+        revenueGrowthPct: inputs.financials?.revenueGrowthPct,
+        operatingMarginPct: inputs.financials?.operatingMarginPct,
         availablePeriodsCount: inputs.financials?.periodsCount || 0,
         summary: fundamentalDim.rationale
       },
@@ -850,7 +854,7 @@ export class DecisionScoringEngine {
     let score = 0.0;
     let rationale = 'Historical strategy backtest indicates neutral risk-adjusted performance.';
 
-    if (sharpe >= 1.2 && maxDd < 25) {
+    if (sharpe >= 1.2 && bt.maxDrawdown != null && maxDd < 25) {
       assessment = 'SUPPORTIVE';
       category = 'POSITIVE';
       score = 0.6;

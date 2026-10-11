@@ -6,6 +6,9 @@
  * catalyst/risk management, what-changed snapshot comparisons, and quantitative/portfolio integration.
  */
 
+import { createHash } from 'crypto';
+import { canRead, normalizePrincipalId } from '../../auth/accessPolicy';
+import { visibleToEngine } from '../../auth/engineScope';
 import {
   ResearchNotebook,
   ResearchSourceItem,
@@ -61,22 +64,23 @@ export class ResearchNotebookService {
   /**
    * Resolves or initializes a Research Notebook for a given security
    */
-  public async getOrCreateNotebook(securityIdOrSymbol: string, researchAsOfDate?: string): Promise<ResearchNotebook> {
+  public async getOrCreateNotebook(securityIdOrSymbol: string, researchAsOfDate?: string, ownerUserId?: string): Promise<ResearchNotebook> {
     const canonical = resolveSecurity(securityIdOrSymbol);
     if (!canonical) {
       throw new Error(`Cannot initialize Research Notebook: Unknown security "${securityIdOrSymbol}".`);
     }
 
-    const notebookId = `nb-${canonical.id}`;
+    const notebookId = this.notebookIdFor(canonical.id, ownerUserId);
     let notebook = this.notebooks.get(notebookId);
 
     // Pre-gather evidence into repository to ensure source registry is populated
     await evidenceService.gatherEvidence({
       securities: [canonical],
-      asOfDate: researchAsOfDate
+      asOfDate: researchAsOfDate,
+      ownerUserId
     });
 
-    const coverage = await this.getCoverage(canonical.id, researchAsOfDate);
+    const coverage = await this.getCoverage(canonical.id, researchAsOfDate, ownerUserId);
     const now = new Date().toISOString();
 
     if (!notebook) {
@@ -84,6 +88,9 @@ export class ResearchNotebookService {
         notebookId,
         securityId: canonical.id,
         symbol: canonical.symbol,
+        ...(normalizePrincipalId(ownerUserId)
+          ? { ownerUserId, userId: ownerUserId, visibility: 'PRIVATE' as const }
+          : { visibility: 'SHARED' as const }), // system notebook built from shared evidence only
         title: `${canonical.symbol} (${canonical.companyName}) Research Notebook`,
         description: `Point-in-time institutional investment research notebook and source corpus for ${canonical.companyName}.`,
         createdAt: now,
@@ -118,10 +125,35 @@ export class ResearchNotebookService {
     return notebook;
   }
 
+  /**
+   * Phase 38.2A: owner-scoped notebook identity. Without an owner the legacy shared id `nb-<securityId>` is kept
+   * (system/test callers); API callers always supply the authenticated owner.
+   */
+  public notebookIdFor(securityId: string, ownerUserId?: string): string {
+    const owner = normalizePrincipalId(ownerUserId);
+    if (!owner) return `nb-${securityId}`;
+    return `nb-${securityId}:${createHash('sha256').update(owner).digest('hex').slice(0, 10)}`;
+  }
+
+  /** Evidence for a security that the given owner (or, when absent, only SHARED data) is allowed to read. */
+  private readableEvidence(canonicalId: string, asOfDate?: string, ownerUserId?: string) {
+    const repo = evidenceService.getRepository();
+    const all = asOfDate
+      ? repo.getEvidenceAvailableAsOf(asOfDate, { securityId: canonicalId })
+      : repo.queryEvidence({ securityId: canonicalId });
+    return all.filter(ev => canRead(ev, ownerUserId));
+  }
+
   public getNotebook(notebookId: string): ResearchNotebook | null {
     return this.notebooks.get(notebookId) || null;
   }
 
+  /** Tenant-scoped listing (mandatory scope). Ownerless legacy notebooks are never listed. */
+  public listNotebooksForOwner(ownerUserId: string): ResearchNotebook[] {
+    return Array.from(this.notebooks.values()).filter(n => canRead(n as any, ownerUserId));
+  }
+
+  /** INTERNAL (system/tests): every notebook regardless of owner. Must never back an HTTP response. */
   public listNotebooks(): ResearchNotebook[] {
     return Array.from(this.notebooks.values());
   }
@@ -129,19 +161,17 @@ export class ResearchNotebookService {
   /**
    * Builds the deterministic source registry for a security as of a given date.
    */
-  public async getNotebookSources(securityId: string, asOfDate?: string): Promise<ResearchSourceItem[]> {
+  public async getNotebookSources(securityId: string, asOfDate?: string, ownerUserId?: string): Promise<ResearchSourceItem[]> {
     const canonical = resolveSecurity(securityId);
     if (!canonical) return [];
 
     await evidenceService.gatherEvidence({
       securities: [canonical],
-      asOfDate
+      asOfDate,
+      ownerUserId
     });
 
-    const repo = evidenceService.getRepository();
-    const allEvidence = asOfDate
-      ? repo.getEvidenceAvailableAsOf(asOfDate, { securityId: canonical.id })
-      : repo.queryEvidence({ securityId: canonical.id });
+    const allEvidence = this.readableEvidence(canonical.id, asOfDate, ownerUserId);
 
     // Deduplicate into high-level source items
     const sourceMap = new Map<string, ResearchSourceItem>();
@@ -192,7 +222,7 @@ export class ResearchNotebookService {
   /**
    * Calculates transparent source coverage for a security as of a given date.
    */
-  public async getCoverage(securityId: string, asOfDate?: string): Promise<SourceCoverage> {
+  public async getCoverage(securityId: string, asOfDate?: string, ownerUserId?: string): Promise<SourceCoverage> {
     const canonical = resolveSecurity(securityId);
     if (!canonical) {
       return {
@@ -207,11 +237,8 @@ export class ResearchNotebookService {
       };
     }
 
-    const sources = await this.getNotebookSources(canonical.id, asOfDate);
-    const repo = evidenceService.getRepository();
-    const evidenceList = asOfDate
-      ? repo.getEvidenceAvailableAsOf(asOfDate, { securityId: canonical.id })
-      : repo.queryEvidence({ securityId: canonical.id });
+    const sources = await this.getNotebookSources(canonical.id, asOfDate, ownerUserId);
+    const evidenceList = this.readableEvidence(canonical.id, asOfDate, ownerUserId);
 
     const availableSources = sources
       .filter(s => s.availabilityStatus === 'AVAILABLE')
@@ -280,15 +307,22 @@ export class ResearchNotebookService {
     asOfDate?: string;
     portfolioContext?: any;
     sourceFilter?: ResearchSourceFilter;
+    ownerUserId?: string;
   }): Promise<ResearchSnapshot> {
-    const { securityId, queryType, customQuery, asOfDate, portfolioContext, sourceFilter } = params;
+    const { securityId, queryType, customQuery, asOfDate, portfolioContext, sourceFilter, ownerUserId } = params;
 
     const canonical = resolveSecurity(securityId);
     if (!canonical) {
       throw new Error(`Cannot execute research: Unknown security "${securityId}".`);
     }
 
-    const notebook = await this.getOrCreateNotebook(canonical.id, asOfDate);
+    const notebook = await this.getOrCreateNotebook(canonical.id, asOfDate, ownerUserId);
+
+    // Phase 38.2D: an ownerless snapshot may be SHARED only if EVERY input is shared. A custom query or portfolio context
+    // is caller-supplied (private/unknown provenance), so such a snapshot stays restricted (ownerless + PRIVATE =>
+    // LEGACY_UNOWNED to the access policy). Fail-closed: any doubt => not shared.
+    const hasCallerSuppliedInput = Boolean((customQuery && String(customQuery).trim()) || portfolioContext);
+    const sharedEligible = !normalizePrincipalId(ownerUserId) && !hasCallerSuppliedInput;
 
     // 1. Build concrete natural query from preset or custom
     const query = customQuery && customQuery.trim()
@@ -300,13 +334,11 @@ export class ResearchNotebookService {
       query,
       securityId: canonical.id,
       asOfDate,
-      limit: 15
+      limit: 15,
+      userId: ownerUserId
     });
 
-    const repo = evidenceService.getRepository();
-    const rawEvidence = asOfDate
-      ? repo.getEvidenceAvailableAsOf(asOfDate, { securityId: canonical.id })
-      : repo.queryEvidence({ securityId: canonical.id });
+    const rawEvidence = this.readableEvidence(canonical.id, asOfDate, ownerUserId);
 
     // Combine retrieved items or fallback to direct repo items
     let candidateEvidence = retrievalResult.evidenceBundle.length > 0
@@ -315,10 +347,8 @@ export class ResearchNotebookService {
 
     if (candidateEvidence.length === 0) {
       // Gather default
-      await evidenceService.gatherEvidence({ securities: [canonical], asOfDate });
-      candidateEvidence = asOfDate
-        ? repo.getEvidenceAvailableAsOf(asOfDate, { securityId: canonical.id })
-        : repo.queryEvidence({ securityId: canonical.id });
+      await evidenceService.gatherEvidence({ securities: [canonical], asOfDate, ownerUserId });
+      candidateEvidence = this.readableEvidence(canonical.id, asOfDate, ownerUserId);
     }
 
     // Apply optional source filtering while preserving epistemic safety
@@ -460,6 +490,11 @@ export class ResearchNotebookService {
       snapshotId: `snap-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
       notebookId: notebook.notebookId,
       securityId: canonical.id,
+      ...(normalizePrincipalId(ownerUserId)
+        ? { ownerUserId, userId: ownerUserId, visibility: 'PRIVATE' as const }
+        : sharedEligible
+          ? { visibility: 'SHARED' as const } // system snapshot derived from shared evidence only
+          : { visibility: 'PRIVATE' as const }), // ownerless but built from caller-supplied query/portfolio context: restricted, never public
       createdAt: new Date().toISOString(),
       researchAsOfDate: asOfDate || new Date().toISOString().split('T')[0],
       evidenceIds: evidenceItems.map(e => e.id),
@@ -931,9 +966,24 @@ export class ResearchNotebookService {
     return this.snapshots.get(notebookId) || [];
   }
 
+  /**
+   * Phase 38.2D: latest snapshot of a notebook that `userId` may use as an INPUT to a derived artifact
+   * (owner === userId, or explicitly SHARED). Ownerless + unclassified (legacy) snapshots hydrated from persistence and
+   * other tenants' snapshots are never returned. With no `userId` only SHARED snapshots qualify (fail-closed).
+   */
+  public getLatestSnapshotVisibleTo(notebookId: string, userId?: string): ResearchSnapshot | null {
+    const snaps = this.getSnapshots(notebookId).filter(sn => visibleToEngine(sn, userId));
+    return snaps.length > 0 ? snaps[snaps.length - 1] : null;
+  }
+
+  /** @internal unfiltered (system/maintenance). Must not feed any derived artifact. */
   public getLatestSnapshot(notebookId: string): ResearchSnapshot | null {
     const snaps = this.getSnapshots(notebookId);
     return snaps.length > 0 ? snaps[snaps.length - 1] : null;
+  }
+
+  public getSnapshotsForOwner(notebookId: string, ownerUserId: string): ResearchSnapshot[] {
+    return this.getSnapshots(notebookId).filter(sn => canRead(sn as any, ownerUserId));
   }
 
   public getSnapshot(snapshotId: string): ResearchSnapshot | null {

@@ -347,86 +347,118 @@ export class SecEdgarProvider implements SECDataProvider {
       });
     };
 
-    // Take recent items for key metrics
-    revenueItems.slice(-12).forEach(it => addFact(it, 'REVENUE', 'Total Revenue'));
-    grossProfitItems.slice(-12).forEach(it => addFact(it, 'GROSS_PROFIT', 'Gross Profit'));
-    operatingIncomeItems.slice(-12).forEach(it => addFact(it, 'OPERATING_INCOME', 'Operating Income'));
-    netIncomeItems.slice(-12).forEach(it => addFact(it, 'NET_INCOME', 'Net Income'));
-    ocfItems.slice(-12).forEach(it => addFact(it, 'OPERATING_CASH_FLOW', 'Operating Cash Flow'));
-    capexItems.slice(-12).forEach(it => addFact(it, 'CAPEX', 'Capital Expenditures'));
-    assetItems.slice(-4).forEach(it => addFact(it, 'TOTAL_ASSETS', 'Total Assets'));
-    liabilityItems.slice(-4).forEach(it => addFact(it, 'TOTAL_LIABILITIES', 'Total Liabilities'));
-    cashItems.slice(-4).forEach(it => addFact(it, 'CASH_AND_EQUIVALENTS', 'Cash & Cash Equivalents'));
-    sharesItems.slice(-4).forEach(it => addFact(it, 'SHARES_OUTSTANDING', 'Common Stock Shares Outstanding', 'shares'));
+    // XBRL concepts are concatenated (e.g. Apple switched revenue tags in 2018), so array order is NOT chronological.
+    // Always dedupe (one value per period, latest filing wins) and sort by period end before taking "recent" items.
+    const dayMs = 86400000;
+    const durationDays = (it: SECXBRLUnitItem): number =>
+      it.start && it.end ? Math.round((Date.parse(it.end) - Date.parse(it.start)) / dayMs) : 0;
+    const chronological = (items: SECXBRLUnitItem[]): SECXBRLUnitItem[] => {
+      const byPeriod = new Map<string, SECXBRLUnitItem>();
+      for (const it of items) {
+        if (!it.end) continue;
+        const key = `${it.start || ''}|${it.end}`;
+        const existing = byPeriod.get(key);
+        if (!existing || (it.filed || '') > (existing.filed || '')) byPeriod.set(key, it);
+      }
+      return [...byPeriod.values()].sort((a, b) => (a.end > b.end ? 1 : a.end < b.end ? -1 : (a.start || '') > (b.start || '') ? 1 : -1));
+    };
+    const revenueSorted = chronological(revenueItems);
+    const grossSorted = chronological(grossProfitItems);
+    const opSorted = chronological(operatingIncomeItems);
+    const netSorted = chronological(netIncomeItems);
+    const ocfSorted = chronological(ocfItems);
+    const capexSorted = chronological(capexItems);
+    const assetSorted = chronological(assetItems);
+    const liabilitySorted = chronological(liabilityItems);
+    const cashSorted = chronological(cashItems);
+    const sharesSorted = chronological(sharesItems);
 
-    // Derived Quarters: Group by fiscal period and form (10-Q / 10-K)
-    // Filter quarterly filings (10-Q or FY 10-K)
-    const quarterlyRevenues = revenueItems
-      .filter(it => it.form === '10-Q' || it.form === '10-K')
-      .filter(it => it.end && it.val > 0);
+    // Flow metrics carry quarterly, year-to-date and annual periods; keep ~4 fiscal years so annual comparisons are possible.
+    revenueSorted.slice(-24).forEach(it => addFact(it, 'REVENUE', 'Total Revenue'));
+    grossSorted.slice(-24).forEach(it => addFact(it, 'GROSS_PROFIT', 'Gross Profit'));
+    opSorted.slice(-24).forEach(it => addFact(it, 'OPERATING_INCOME', 'Operating Income'));
+    netSorted.slice(-24).forEach(it => addFact(it, 'NET_INCOME', 'Net Income'));
+    ocfSorted.slice(-24).forEach(it => addFact(it, 'OPERATING_CASH_FLOW', 'Operating Cash Flow'));
+    capexSorted.slice(-24).forEach(it => addFact(it, 'CAPEX', 'Capital Expenditures'));
+    assetSorted.slice(-4).forEach(it => addFact(it, 'TOTAL_ASSETS', 'Total Assets'));
+    liabilitySorted.slice(-4).forEach(it => addFact(it, 'TOTAL_LIABILITIES', 'Total Liabilities'));
+    cashSorted.slice(-4).forEach(it => addFact(it, 'CASH_AND_EQUIVALENTS', 'Cash & Cash Equivalents'));
+    sharesSorted.slice(-4).forEach(it => addFact(it, 'SHARES_OUTSTANDING', 'Common Stock Shares Outstanding', 'shares'));
 
-    // Sort by period end ascending
-    quarterlyRevenues.sort((a, b) => (a.end > b.end ? 1 : -1));
+    // Discrete (single-quarter) value for the quarter ending `qe`:
+    //   (a) a reported ~3-month item ending on qe, else
+    //   (b) cumulative item (same fiscal-year start) minus the previous cumulative item (same start, earlier end).
+    // Returns undefined when it cannot be derived from reported figures. Nothing is estimated.
+    const discreteValue = (sorted: SECXBRLUnitItem[], qe: string): { val: number; item: SECXBRLUnitItem } | undefined => {
+      const atEnd = sorted.filter(it => it.end === qe);
+      const quarter = atEnd.find(it => durationDays(it) >= 80 && durationDays(it) <= 100);
+      if (quarter) return { val: quarter.val, item: quarter };
+      for (const cum of atEnd.filter(it => durationDays(it) > 100)) {
+        const prior = sorted
+          .filter(it => it.start === cum.start && it.end < qe)
+          .sort((a, b) => (a.end > b.end ? -1 : 1))[0];
+        if (prior) return { val: cum.val - prior.val, item: cum };
+      }
+      return undefined;
+    };
 
-    // Take the last 5 distinct reporting quarters
-    const recentRevQuarters = quarterlyRevenues.slice(-5);
+    // Candidate quarter ends: reported 3-month periods plus fiscal year ends (Q4 = annual minus 9 months).
+    const quarterEnds = [...new Set(
+      revenueSorted
+        .filter(it => it.form === '10-Q' || it.form === '10-K')
+        .filter(it => { const d = durationDays(it); return (d >= 80 && d <= 100) || (d >= 350 && d <= 380); })
+        .map(it => it.end)
+    )].sort();
 
-    const derivedQuarters = recentRevQuarters.map(revItem => {
-      const matchGross = grossProfitItems.find(g => g.end === revItem.end && g.form === revItem.form);
-      const matchOpInc = operatingIncomeItems.find(o => o.end === revItem.end && o.form === revItem.form);
-      const matchNetInc = netIncomeItems.find(n => n.end === revItem.end && n.form === revItem.form);
-      const matchOcf = ocfItems.find(c => c.end === revItem.end);
-      const matchCapex = capexItems.find(cp => cp.end === revItem.end);
-
-      const revVal = revItem.val;
-      const gpVal = matchGross ? matchGross.val : (revVal * 0.74); // fallback if separate XBRL tag
-      const opVal = matchOpInc ? matchOpInc.val : (revVal * 0.61);
-      const netVal = matchNetInc ? matchNetInc.val : (revVal * 0.54);
-      const ocfVal = matchOcf ? matchOcf.val : (revVal * 0.48);
-      const capexVal = matchCapex ? Math.abs(matchCapex.val) : (revVal * 0.05);
-
-      // Deterministic calculations
-      const fcfVal = ocfVal - capexVal;
-      const grossMarginPct = revVal > 0 ? (gpVal / revVal) * 100 : 0;
-
-      // Label period nicely (e.g., "Q2 25" or "FY 24")
-      const periodLabel = revItem.fp && revItem.fy
-        ? `${revItem.fp} '${String(revItem.fy).slice(-2)}`
-        : revItem.end;
-
+    const allQuarters = quarterEnds.slice(-12).reverse().flatMap(qe => {
+      const rev = discreteValue(revenueSorted, qe);
+      const gp = discreteValue(grossSorted, qe);
+      const op = discreteValue(opSorted, qe);
+      const ni = discreteValue(netSorted, qe);
+      const ocf = discreteValue(ocfSorted, qe);
+      const cx = discreteValue(capexSorted, qe);
+      // A quarter is shown only if every figure is derivable from reported XBRL facts.
+      if (!rev || !gp || !op || !ni || !ocf || !cx || rev.val <= 0) return [];
+      const revItem = rev.item;
+      const capexVal = Math.abs(cx.val);
+      const fcfVal = ocf.val - capexVal;
+      const grossMarginPct = (gp.val / rev.val) * 100;
+      // Label by the quarter's own end date (the filing's fy/fp describe the filing, not a prior-year comparative period).
+      const qeDate = new Date(`${qe}T00:00:00Z`);
+      const periodLabel = `${qeDate.toLocaleString('en-US', { month: 'short', timeZone: 'UTC' })} '${String(qeDate.getUTCFullYear()).slice(-2)}`;
       const accnNoHyphens = revItem.accn ? revItem.accn.replace(/-/g, '') : '';
       const sourceUrl = accnNoHyphens
         ? `https://www.sec.gov/Archives/edgar/data/${cikNumber}/${accnNoHyphens}/`
         : `https://www.sec.gov/edgar/browse/?CIK=${cik}`;
-
-      return {
+      return [{
         period: periodLabel,
         fiscalYear: revItem.fy,
         fiscalPeriod: revItem.fp,
-        revenue: Math.round(revVal / 1e6) / 1e3, // In Billions ($B)
-        grossProfit: Math.round(gpVal / 1e6) / 1e3,
+        periodEnd: qe,
+        revenue: Math.round(rev.val / 1e6) / 1e3, // In Billions ($B)
+        grossProfit: Math.round(gp.val / 1e6) / 1e3,
         grossMarginPct: Math.round(grossMarginPct * 10) / 10,
-        operatingIncome: Math.round(opVal / 1e6) / 1e3,
-        netIncome: Math.round(netVal / 1e6) / 1e3,
-        operatingCashFlow: Math.round(ocfVal / 1e6) / 1e3,
+        operatingIncome: Math.round(op.val / 1e6) / 1e3,
+        netIncome: Math.round(ni.val / 1e6) / 1e3,
+        operatingCashFlow: Math.round(ocf.val / 1e6) / 1e3,
         capex: Math.round(capexVal / 1e6) / 1e3,
         freeCashFlow: Math.round(fcfVal / 1e6) / 1e3,
         form: revItem.form || '10-Q',
-        filedDate: revItem.filed || revItem.end,
+        filedDate: revItem.filed || qe,
         accessionNumber: revItem.accn || 'SEC-XBRL',
         sourceUrl,
         isSimulated: false
-      };
-    });
+      }];
+    }).reverse(); // chronological; up to 12 quarters (enough for like-for-like comparisons at earlier as-of dates)
+    const derivedQuarters = allQuarters.slice(-5);
 
-    // Summary metrics
-    const latestRev = revenueItems[revenueItems.length - 1]?.val;
-    const latestGross = grossProfitItems[grossProfitItems.length - 1]?.val;
-    const latestOp = operatingIncomeItems[operatingIncomeItems.length - 1]?.val;
-    const latestAssets = assetItems[assetItems.length - 1]?.val;
-    const latestLiab = liabilityItems[liabilityItems.length - 1]?.val;
-    const latestCash = cashItems[cashItems.length - 1]?.val;
-    const latestShares = sharesItems[sharesItems.length - 1]?.val;
+    // Summary metrics (from the latest derivable discrete quarter, never from a mixed-period item)
+    const latestQ = derivedQuarters[derivedQuarters.length - 1];
+    const latestRev = latestQ ? latestQ.revenue * 1e9 : undefined;
+    const latestAssets = assetSorted[assetSorted.length - 1]?.val;
+    const latestLiab = liabilitySorted[liabilitySorted.length - 1]?.val;
+    const latestCash = cashSorted[cashSorted.length - 1]?.val;
+    const latestShares = sharesSorted[sharesSorted.length - 1]?.val;
 
     return {
       ticker: ticker.toUpperCase(),
@@ -437,10 +469,11 @@ export class SecEdgarProvider implements SECDataProvider {
       facts: normalizedFacts,
       filings,
       derivedQuarters,
+      historicalQuarters: allQuarters,
       summaryMetrics: {
         latestQuarterlyRevenue: latestRev,
-        latestGrossMarginPct: latestRev && latestGross ? (latestGross / latestRev) * 100 : undefined,
-        latestOperatingMarginPct: latestRev && latestOp ? (latestOp / latestRev) * 100 : undefined,
+        latestGrossMarginPct: latestQ ? latestQ.grossMarginPct : undefined,
+        latestOperatingMarginPct: latestQ && latestQ.revenue > 0 ? Math.round((latestQ.operatingIncome / latestQ.revenue) * 1000) / 10 : undefined,
         sharesOutstanding: latestShares,
         totalAssets: latestAssets,
         totalLiabilities: latestLiab,

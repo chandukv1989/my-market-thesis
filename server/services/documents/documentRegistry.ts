@@ -11,10 +11,19 @@ import {
   DocumentRegistryStats
 } from '../../../src/types';
 import { persistenceManager } from '../../persistence/persistenceManager';
+import { canRead, resolveOwnerId } from '../../auth/accessPolicy';
+
+/**
+ * Phase 38.2A: content-hash deduplication is scoped per owner so one tenant's upload can never
+ * resolve to (and disclose) another tenant's document.
+ */
+function hashKey(doc: { contentHash: string; ownerUserId?: string; userId?: string }): string {
+  return `${resolveOwnerId(doc) || ''}::${doc.contentHash}`;
+}
 
 export class DocumentRegistry {
   private documents: Map<string, ResearchDocument> = new Map();
-  private documentsByHash: Map<string, string> = new Map(); // contentHash -> documentId
+  private documentsByHash: Map<string, string> = new Map(); // ownerScopedHashKey -> documentId
 
   /**
    * Hydrates memory cache from the persistent repository
@@ -24,7 +33,7 @@ export class DocumentRegistry {
       const persisted = await persistenceManager.getDocumentRepository().getAll();
       for (const doc of persisted) {
         this.documents.set(doc.documentId, doc);
-        this.documentsByHash.set(doc.contentHash, doc.documentId);
+        this.documentsByHash.set(hashKey(doc), doc.documentId);
       }
       return persisted.length;
     } catch (err) {
@@ -42,7 +51,7 @@ export class DocumentRegistry {
     document: ResearchDocument;
   } {
     // 1. Exact content hash deduplication
-    const existingDocId = this.documentsByHash.get(doc.contentHash);
+    const existingDocId = this.documentsByHash.get(hashKey(doc));
     if (existingDocId && this.documents.has(existingDocId)) {
       const existing = this.documents.get(existingDocId)!;
       return {
@@ -54,7 +63,7 @@ export class DocumentRegistry {
 
     // 2. Store document in memory
     this.documents.set(doc.documentId, doc);
-    this.documentsByHash.set(doc.contentHash, doc.documentId);
+    this.documentsByHash.set(hashKey(doc), doc.documentId);
 
     // 3. Persist asynchronously
     persistenceManager.getDocumentRepository().save(doc).catch(err => {
@@ -78,8 +87,8 @@ export class DocumentRegistry {
   /**
    * Retrieves document by content hash.
    */
-  public getDocumentByHash(contentHash: string): ResearchDocument | undefined {
-    const docId = this.documentsByHash.get(contentHash);
+  public getDocumentByHash(contentHash: string, ownerUserId?: string): ResearchDocument | undefined {
+    const docId = this.documentsByHash.get(`${ownerUserId || ''}::${contentHash}`);
     return docId ? this.documents.get(docId) : undefined;
   }
 
@@ -87,12 +96,8 @@ export class DocumentRegistry {
    * Lists documents associated with a specific security, optionally filtered by user ownership.
    */
   public getDocumentsBySecurity(securityId?: string, userId?: string): ResearchDocument[] {
-    let docs = Array.from(this.documents.values());
-    if (userId) {
-      docs = docs.filter(d => !d.ownerUserId || d.ownerUserId === userId);
-    } else {
-      docs = docs.filter(d => !d.ownerUserId);
-    }
+    // Phase 38.2A: fail-closed. Owner match or explicit SHARED only; ownerless legacy docs are never listed.
+    let docs = Array.from(this.documents.values()).filter(d => canRead(d as any, userId));
     if (!securityId) {
       return docs.filter(d => !d.securityId);
     }
@@ -108,11 +113,16 @@ export class DocumentRegistry {
    * Lists all registered documents, optionally scoped to a user.
    */
   public getAllDocuments(userId?: string): ResearchDocument[] {
-    const docs = Array.from(this.documents.values());
-    if (userId) {
-      return docs.filter(d => !d.ownerUserId || d.ownerUserId === userId);
-    }
-    return docs.filter(d => !d.ownerUserId);
+    // Phase 38.2A: fail-closed. Owner match or explicit SHARED only; ownerless legacy docs are never listed.
+    return Array.from(this.documents.values()).filter(d => canRead(d as any, userId));
+  }
+
+  /**
+   * INTERNAL (system/maintenance/tests only): every registered document regardless of owner.
+   * Must never back an HTTP response.
+   */
+  public getAllDocumentsUnscopedInternal(): ResearchDocument[] {
+    return Array.from(this.documents.values());
   }
 
   /**
@@ -156,7 +166,7 @@ export class DocumentRegistry {
     const doc = this.documents.get(documentId);
     if (!doc) return false;
 
-    this.documentsByHash.delete(doc.contentHash);
+    this.documentsByHash.delete(hashKey(doc));
     this.documents.delete(documentId);
     return true;
   }
@@ -164,8 +174,9 @@ export class DocumentRegistry {
   /**
    * Returns comprehensive registry metrics.
    */
-  public getStats(): DocumentRegistryStats {
-    const docs = Array.from(this.documents.values());
+  public getStats(userId?: string): DocumentRegistryStats {
+    // Phase 38.2A: stats only ever describe documents the caller may read.
+    const docs = Array.from(this.documents.values()).filter(d => canRead(d as any, userId));
     const bySec: Record<string, number> = {};
     const byType: Record<string, number> = {};
     let totalEvidence = 0;

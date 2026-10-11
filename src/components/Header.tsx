@@ -13,6 +13,9 @@ interface HeaderProps {
   portfolioNav: number;
   portfolioTodayChangePct: number;
   dataSourcesHealth?: DataSourcesHealth;
+  /** Phase 38.2B: signed-in identity + sign-out */
+  userEmail?: string;
+  onLogout?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -23,7 +26,9 @@ export const Header: React.FC<HeaderProps> = ({
   onSelectStock,
   portfolioNav,
   portfolioTodayChangePct,
-  dataSourcesHealth
+  dataSourcesHealth,
+  userEmail,
+  onLogout
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [showLegendModal, setShowLegendModal] = useState(false);
@@ -313,6 +318,17 @@ export const Header: React.FC<HeaderProps> = ({
             {portfolioTodayChangePct >= 0 ? '+' : ''}{portfolioTodayChangePct.toFixed(2)}%
           </span>
         </button>
+
+        {onLogout && (
+          <button
+            onClick={onLogout}
+            title={userEmail ? `Signed in as ${userEmail}` : 'Sign out'}
+            className="flex items-center gap-1 px-2 py-1 bg-[#0d1c2d] hover:bg-[#1c2b3c] border border-[#1c2b3c] rounded-sm text-xs font-mono-data text-[#bdc8d1] transition-colors"
+          >
+            <span className="hidden xl:inline text-[11px] max-w-[140px] truncate">{userEmail}</span>
+            <span className="text-[11px] text-[#38bdf8]">SIGN OUT</span>
+          </button>
+        )}
 
         {/* Epistemic Provenance Guide modal toggle */}
         <button

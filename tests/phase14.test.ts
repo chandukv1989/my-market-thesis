@@ -92,6 +92,10 @@ async function runPhase14Tests() {
   console.log('======================================================================\n');
 
   const ingestionService = new DocumentIngestionService();
+  // Phase 38.2A: ownerless documents are no longer implicitly public. These system-level fixtures are explicitly
+  // classified SHARED reference documents so the (unchanged) retrieval assertions below keep exercising the pipeline.
+  const rawIngest = ingestionService.ingestDocument.bind(ingestionService);
+  ingestionService.ingestDocument = (req) => rawIngest({ visibility: 'SHARED', ...req });
   const repo = evidenceService.getRepository();
 
   // Reset registries

@@ -16,6 +16,7 @@
  * - AI Resilience: Uses aiCircuitBreaker for optional executive briefing; Gemini has ZERO authority over numbers
  */
 
+import { latestDecisionVisibleTo, latestSnapshotVisibleTo, visibleToEngine } from '../../auth/engineScope';
 import { GoogleGenAI } from '@google/genai';
 import {
   CanonicalSecurity,
@@ -245,14 +246,14 @@ export class PortfolioScenarioService {
     });
 
     const decisionRepo = persistenceManager.getDecisionRepository();
-    const allDecisions = await decisionRepo.getAll();
+    const allDecisions = (await decisionRepo.getAll()).filter(d => visibleToEngine(d, userId));
     const pitDecisions = allDecisions.filter(d => {
       const dateVal = (d as any).asOfDate || (d as any).evaluatedAt || (d as any).createdAt || 0;
       return new Date(dateVal).getTime() <= asOfTimestamp;
     });
 
     const evidenceRepo = persistenceManager.getEvidenceRepository();
-    const allEvidence = await evidenceRepo.getAll();
+    const allEvidence = (await evidenceRepo.getAll()).filter(e => visibleToEngine(e, userId));
     const pitEvidence = allEvidence.filter(e => {
       const dateVal = (e as any).asOfDate || (e as any).verifiedAt || (e as any).createdAt || (e as any).timestamp || 0;
       return new Date(dateVal).getTime() <= asOfTimestamp;

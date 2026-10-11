@@ -16,6 +16,7 @@
  * 12. Gemini Boundary & Strict Epistemic Separation
  */
 
+import { classifyLegacyFixturesSharedForTest } from './helpers/legacyFixtures';
 import assert from 'node:assert';
 import { investmentMonitorEngine } from '../server/services/monitor/investmentMonitorEngine';
 import { persistenceManager } from '../server/persistence/persistenceManager';
@@ -45,6 +46,8 @@ async function runTest(name: string, fn: () => void | Promise<void>) {
 }
 
 async function runAllPhase26Tests() {
+  // Phase 38.2B: ownerless legacy fixtures are no longer implicitly visible; classify them explicitly (in-memory, test only).
+  await classifyLegacyFixturesSharedForTest();
   console.log('--- TEST GROUP 1: REVIEW LOADING & STATE INTEGRITY ---');
 
   await runTest('Monitor and current evaluation state load correctly', async () => {

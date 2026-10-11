@@ -7,18 +7,38 @@
  * - Safe transaction boundaries with automatic ROLLBACK on failure
  */
 
+import { AsyncLocalStorage } from 'async_hooks';
 import { Pool, PoolClient, QueryResult, QueryResultRow } from 'pg';
 import { DatabaseConfig, getDatabaseConfig } from '../databaseConfig';
 
-export class PostgresClient {
-  private pool: Pool | null = null;
-  private config: DatabaseConfig;
+/** Minimal pool surface used by the client (lets tests inject a double; no database is contacted). */
+export interface PoolLike {
+  connect(): Promise<PoolClient>;
+  query<R extends QueryResultRow = any>(text: string, params?: any[]): Promise<QueryResult<R>>;
+  end(): Promise<void>;
+}
 
-  constructor(config?: DatabaseConfig) {
+export class PostgresClient {
+  private pool: PoolLike | null = null;
+  private config: DatabaseConfig;
+  /**
+   * Phase 38.2B: the connection checked out by the innermost active runTransaction() on this async call chain.
+   * Every `query()` issued anywhere inside the transaction callback (including repository calls) is routed to this
+   * SAME connection, so reads and writes share one BEGIN…COMMIT scope.
+   */
+  private readonly txContext = new AsyncLocalStorage<PoolClient>();
+
+  constructor(config?: DatabaseConfig, poolOverride?: PoolLike) {
     this.config = config || getDatabaseConfig();
+    if (poolOverride) this.pool = poolOverride;
   }
 
   public async connect(): Promise<boolean> {
+    if (this.pool && !this.config.isConfigured) {
+      // Injected pool (tests): just verify it answers.
+      const c = await this.pool.connect();
+      try { await c.query('SELECT 1 AS health_check;'); return true; } finally { c.release(); }
+    }
     if (!this.config.isConfigured || !this.config.databaseUrl) {
       return false;
     }
@@ -53,7 +73,7 @@ export class PostgresClient {
     if (!this.pool) {
       throw new Error('PostgresClient is not connected. Call connect() first or verify DATABASE_URL.');
     }
-    return this.pool;
+    return this.pool as Pool;
   }
 
   public isConnected(): boolean {
@@ -74,24 +94,52 @@ export class PostgresClient {
     if (!this.pool) {
       throw new Error('Cannot execute query: PostgreSQL pool is not connected.');
     }
+    const tx = this.txContext.getStore();
+    if (tx) {
+      return tx.query<R>(text, params);
+    }
     return this.pool.query<R>(text, params);
   }
 
+  public isInTransaction(): boolean {
+    return this.txContext.getStore() !== undefined;
+  }
+
+  /**
+   * Runs `work` inside BEGIN…COMMIT on ONE checked-out connection.
+   * - Repository calls made through this client inside `work` use that connection (see txContext).
+   * - Any failure (including a failed COMMIT) triggers ROLLBACK; the original error is always rethrown.
+   * - If ROLLBACK itself fails the connection is considered broken and is destroyed (release(err)) rather than
+   *   being returned to the pool.
+   * - A nested call joins the outer transaction (no second connection, no premature COMMIT).
+   */
   public async runTransaction<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
     if (!this.pool) {
       throw new Error('Cannot run transaction: PostgreSQL pool is not connected.');
     }
+    const existing = this.txContext.getStore();
+    if (existing) {
+      return work(existing);
+    }
     const client = await this.pool.connect();
+    let broken: Error | undefined;
     try {
       await client.query('BEGIN');
-      const result = await work(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
+      try {
+        const result = await this.txContext.run(client, () => work(client));
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackError) {
+          broken = rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError));
+        }
+        throw error;
+      }
     } finally {
-      client.release();
+      // Passing an error to release() makes pg discard the connection instead of reusing it.
+      client.release(broken as any);
     }
   }
 

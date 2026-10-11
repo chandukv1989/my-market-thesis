@@ -55,6 +55,7 @@ async function runPhase8bTests() {
 
   // Sample verified evidence items
   const sampleRealSecItem: EvidenceItem = {
+    visibility: 'SHARED', // Phase 38.2A: explicit shared classification (ownerless is no longer implicitly public)
     evidenceId: 'sec-nvda-10q-2025q1-rev',
     fingerprint: 'sec-edgar:nvda:revenue:2025-q1',
     conceptKey: 'nvda:revenue:2025-q1',
@@ -85,6 +86,7 @@ async function runPhase8bTests() {
   };
 
   const sampleRealMarketQuote: EvidenceItem = {
+    visibility: 'SHARED', // Phase 38.2A: explicit shared classification (ownerless is no longer implicitly public)
     evidenceId: 'mkt-nvda-quote-20240522',
     fingerprint: 'twelve-data:nvda:quote:2024-05-22',
     conceptKey: 'nvda:quote:2024-05-22',
@@ -107,6 +109,7 @@ async function runPhase8bTests() {
   };
 
   const sampleSimulatedQuote: EvidenceItem = {
+    visibility: 'SHARED', // Phase 38.2A: explicit shared classification (ownerless is no longer implicitly public)
     evidenceId: 'mkt-reli-sim-quote',
     fingerprint: 'truedata:reliance:quote:simulated',
     conceptKey: 'reliance:quote:simulated',
@@ -128,6 +131,7 @@ async function runPhase8bTests() {
   };
 
   const sampleUnavailableItem: EvidenceItem = {
+    visibility: 'SHARED', // Phase 38.2A: explicit shared classification (ownerless is no longer implicitly public)
     evidenceId: 'mkt-unavail-xyz',
     fingerprint: 'market:xyz:unavailable',
     conceptKey: 'xyz:quote:latest',
@@ -233,6 +237,7 @@ async function runPhase8bTests() {
   console.log('\n5. Point-in-Time Retrieval Filtering:');
   // Add a future event published on 2025-01-01
   const futureItem: EvidenceItem = {
+    visibility: 'SHARED', // Phase 38.2A: explicit shared classification (ownerless is no longer implicitly public)
     ...sampleRealSecItem,
     evidenceId: 'sec-nvda-future-10k',
     title: 'Future NVDA 2025 10-K',
@@ -305,6 +310,7 @@ async function runPhase8bTests() {
   console.log('\n7. Conflict Preservation:');
   // Register conflicting revenue evidence for same concept & period from different provider
   const conflictingSecItem: EvidenceItem = {
+    visibility: 'SHARED', // Phase 38.2A: explicit shared classification (ownerless is no longer implicitly public)
     ...sampleRealSecItem,
     evidenceId: 'alt-nvda-2025q1-rev',
     fingerprint: 'alt-feed:nvda:revenue:2025-q1',
@@ -344,6 +350,7 @@ async function runPhase8bTests() {
   console.log('\n8. Multi-Source Diversity & Budgeting:');
   // Add canonical metadata item
   const canonicalItem: EvidenceItem = {
+    visibility: 'SHARED', // Phase 38.2A: explicit shared classification (ownerless is no longer implicitly public)
     evidenceId: 'meta-nvda-canonical',
     conceptKey: 'nvda:canonical:meta',
     securityId: 'NVDA',

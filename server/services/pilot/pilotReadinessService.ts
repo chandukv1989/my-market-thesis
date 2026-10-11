@@ -689,7 +689,8 @@ export class PilotReadinessService {
       const decisionService = DecisionIntelligenceService.getInstance();
       const assessment = await decisionService.evaluateDecision({
         securityId: canonical.id,
-        asOfDate: new Date().toISOString().split('T')[0]
+        asOfDate: new Date().toISOString().split('T')[0],
+        ownerUserId: tenantId
       });
       decisionId = assessment.decisionId || `dec_${canonical.id}_${Date.now()}`;
       steps.push({

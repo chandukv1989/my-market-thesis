@@ -29,7 +29,7 @@ import {
 } from '../../../src/state/portfolioEngine';
 import { CANONICAL_SECURITIES_MAP } from '../../../src/data/mockData';
 import { portfolioEvidenceAdapter } from '../evidence/adapters/portfolioEvidenceAdapter';
-import { evidenceService } from '../evidence/evidenceService';
+import { evidenceService, scopePortfolioEvidenceToOwner } from '../evidence/evidenceService';
 import { retrievalEngine } from '../retrieval/retrievalEngine';
 import { resolveSecurity } from '../../../src/data/canonicalSecurities';
 
@@ -166,7 +166,7 @@ export class PortfolioIntelligenceService {
    * semantic evidence retrieval, and strict epistemic explanation.
    */
   public async analyzePortfolioQuestion(request: PortfolioAnalysisRequest): Promise<PortfolioAnalysisResponse> {
-    const { query, portfolioContext, asOfDate } = request;
+    const { query, portfolioContext, asOfDate, ownerUserId } = request;
     const intent = this.classifyIntent(query);
 
     // 1. Obtain deterministic metrics
@@ -243,12 +243,14 @@ export class PortfolioIntelligenceService {
       undefined,
       asOfDate
     );
-    evidenceService.getRepository().addEvidenceBatch(portItems);
+    // Phase 38.2A: owner-scoped (PRIVATE) when the analysis runs on behalf of an authenticated user.
+    evidenceService.getRepository().addEvidenceBatch(scopePortfolioEvidenceToOwner(portItems, ownerUserId));
 
     // 4. Semantic retrieval targeted for this portfolio question
     const retrievalResult = await retrievalEngine.retrieve({
       query,
-      securityIds: metrics.positions.map(p => p.symbol)
+      securityIds: metrics.positions.map(p => p.symbol),
+      userId: ownerUserId
     });
 
     const retrievedEvidence: ResearchEvidenceItem[] = retrievalResult.evidenceBundle.map(ev => ({

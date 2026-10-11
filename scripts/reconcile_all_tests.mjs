@@ -38,7 +38,7 @@ for (const suite of suites) {
   let output = '';
   let exitCode = 0;
   try {
-    output = execSync(`./node_modules/.bin/tsx ${suite.file}`, {
+    output = execSync(`./node_modules/.bin/tsx --env-file=.env ${suite.file}`, {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 120000
@@ -58,8 +58,8 @@ for (const suite of suites) {
   // e.g. "TOTAL: 52 | PASSED: 52 | FAILED: 0"
   // e.g. "TEST SUITE SUMMARY: 65 PASSED / 0 FAILED (TOTAL: 65)"
 
-  // Let's count individual pass lines:
-  const passMarks = (output.match(/(?:✓|✅|\[✓\])\s+(?:\[PASS\]|\[Scenario|Scenario|Test|[A-Z])/gi) || []).length;
+  // Count checks in output
+  const passMarks = (output.match(/(?:✓|✅|\[✓\])\s+/gi) || []).length;
   const failMarks = (output.match(/(?:❌|\[FAIL\])\s+/gi) || []).length;
 
   // Also check if the test suite prints an explicit summary
@@ -70,7 +70,7 @@ for (const suite of suites) {
 
   // Regex matches for explicit summaries
   const m1 = output.match(/(\d+)\s*\/\s*(\d+)\s*(?:TESTS\s+)?PASSED/i);
-  const m2 = output.match(/PASSED:\s*(\d+)\s*\/\s*FAILED:\s*(\d+)\s*\(TOTAL:\s*(\d+)\)/i);
+  const m2 = output.match(/(?:PASSED:\s*)?(\d+)\s*(?:PASSED)?\s*\/\s*(?:FAILED:\s*)?(\d+)\s*(?:FAILED)?\s*\(TOTAL:\s*(\d+)\)/i);
   const m3 = output.match(/TOTAL:\s*(\d+)\s*\|\s*PASSED:\s*(\d+)\s*\|\s*FAILED:\s*(\d+)/i);
   const m4 = output.match(/PASSED:\s*(\d+)\s*\/\s*(\d+)/i);
   const m5 = output.match(/ALL.*?PASSED:\s*(\d+)\s*\/\s*(\d+)/i);
