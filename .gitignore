@@ -7,3 +7,7 @@ coverage/
 .env*
 !.env.example
 .dev-logs/
+
+# Local app database (contains accounts/sessions) and backups: never commit
+data/persistence/
+data/backup/
